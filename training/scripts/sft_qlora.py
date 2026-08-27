@@ -34,7 +34,9 @@ def parse_args():
                     help="Per-device train batch size. Keep 1 on T4/L4 with grad-accum.")
     ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--max-seq-len", type=int, default=2048)
+    ap.add_argument("--max-seq-len", type=int, default=1024,
+                    help="Sequence length cap. 1024 fits Qwen3-8B QLoRA on T4/15GB; "
+                         "bump to 2048 on L4/24GB or 4096 on A100.")
     ap.add_argument("--lora-r",     type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
@@ -114,7 +116,7 @@ def main() -> int:
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
-        max_seq_length=args.max_seq_len,
+        max_length=args.max_seq_len,   # was `max_seq_length` in trl<1.0
         bf16=True,
         gradient_checkpointing=True,
         logging_steps=10,
