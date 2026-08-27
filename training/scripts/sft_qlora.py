@@ -119,7 +119,7 @@ def main() -> int:
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=10,               # trl 1.x dropped warmup_ratio; ~3% of typical run
         max_length=args.max_seq_len,   # was `max_seq_length` in trl<1.0
         bf16=True,
         gradient_checkpointing=True,
