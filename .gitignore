@@ -1,0 +1,21 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+
+# Training artifacts
+datasets/raw/
+datasets/**/private_*.jsonl
+training/adapters/**/*.safetensors
+training/adapters/**/*.bin
+training/adapters/**/wandb/
+training/adapters/**/checkpoints/
+
+# Ephemeral
+*.log
+.DS_Store
+.idea/
+.vscode/settings.json
+coverage/

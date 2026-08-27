@@ -1,0 +1,23 @@
+{
+  "name": "kaizen-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kaizen AI — Autonomous Entrepreneur AI (Kaizen LLC)",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "author": "Kaizen LLC",
+  "license": "UNLICENSED"
+}
