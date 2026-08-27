@@ -120,8 +120,10 @@ def main() -> int:
         bnb_4bit_use_double_quant=True,
     )
     print(f"→ loading base {args.base_model}")
+    # Force GPU 0 — see sft_qlora.py comment. Avoids bnb rejecting CPU dispatch.
+    device_map = {"": 0} if torch.cuda.is_available() else None
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, quantization_config=bnb, device_map="auto", trust_remote_code=True,
+        args.base_model, quantization_config=bnb, device_map=device_map, trust_remote_code=True,
     )
     if args.candidate:
         from peft import PeftModel

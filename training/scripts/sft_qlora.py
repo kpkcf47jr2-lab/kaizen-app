@@ -80,10 +80,15 @@ def main() -> int:
     # but requires `pip install flash-attn`, which is heavy and not on the free
     # studio image. Ship works everywhere first, optimize later.
     attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
+    # device_map="auto" was dispatching modules to CPU on T4 even though the
+    # 4-bit weights fit — bnb quantizer then rejects mixed placement. Force
+    # everything on GPU 0. If we actually OOM here it'll be a clean CUDA OOM,
+    # not a confusing quantizer validation error.
+    device_map = {"": 0} if torch.cuda.is_available() else None
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         quantization_config=bnb,
-        device_map="auto",
+        device_map=device_map,
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
