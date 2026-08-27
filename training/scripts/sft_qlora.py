@@ -28,7 +28,10 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir",  type=Path, required=True)
     ap.add_argument("--out-dir",   type=Path, required=True)
-    ap.add_argument("--base-model", type=str, default="Qwen/Qwen3-8B")
+    # Qwen2.5-7B-Instruct: Apache 2.0, tool-use trained, fits T4 15GB in 4-bit
+    # with room for activations. Qwen3-8B overflows T4 device_map=auto. Upgrade
+    # to 8B or 14B when we move to L4/A100.
+    ap.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--epochs",    type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=1,
                     help="Per-device train batch size. Keep 1 on T4/L4 with grad-accum.")

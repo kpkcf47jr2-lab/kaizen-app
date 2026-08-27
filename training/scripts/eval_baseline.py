@@ -98,7 +98,7 @@ def generate_smoke(model, tokenizer, device: str) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", type=Path, required=True)
-    ap.add_argument("--base-model", type=str, default="Qwen/Qwen3-8B")
+    ap.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--candidate", type=Path, default=None,
                     help="Optional adapter path — evaluates base+adapter if given.")
     ap.add_argument("--report-out", type=Path, required=True)
