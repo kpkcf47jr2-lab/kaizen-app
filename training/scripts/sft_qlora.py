@@ -73,12 +73,16 @@ def main() -> int:
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
+    # SDPA is built into PyTorch — no extra install. FlashAttention2 is faster
+    # but requires `pip install flash-attn`, which is heavy and not on the free
+    # studio image. Ship works everywhere first, optimize later.
+    attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else None,
+        attn_implementation=attn_impl,
     )
     model = prepare_model_for_kbit_training(model)
 
