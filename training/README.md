@@ -44,7 +44,28 @@ kaizenDataset.js  ─── scp ──►       datasets/raw/*.jsonl
                                         → deploy via vLLM
 ```
 
-## 0. Copy raw data from Oracle
+## 0a. Lightning AI setup (once)
+
+Copy `.env.example` → `.env` and fill in `LIGHTNING_USER_ID` + `LIGHTNING_API_KEY`
+(from https://lightning.ai → user menu → API keys). Then:
+
+```bash
+set -a; source .env; set +a
+python training/scripts/lightning_setup.py                 # verify auth + list studios
+python training/scripts/lightning_setup.py --start-gpu L4  # spin up training studio
+# ...training work...
+python training/scripts/lightning_setup.py --stop          # stop when idle → saves credits
+```
+
+Machine sizing rule of thumb for Qwen3-8B QLoRA 4-bit:
+- **L4** (24GB): fits `seq_len=2048, batch=1, grad_accum=16`. Slowest but cheapest.
+- **A100** (40/80GB): fits `seq_len=4096, batch=2`. ~3x faster than L4.
+- **H100** (80GB): fits `seq_len=8192, batch=4`. ~2x faster than A100.
+
+Start on L4 for the first Kaizen-8B-v0.1 run. Upgrade only if wall-clock becomes
+the bottleneck. Free tier burns fast on H100.
+
+## 0b. Copy raw data from Oracle
 
 Owner runs (has SSH key on Oracle):
 
