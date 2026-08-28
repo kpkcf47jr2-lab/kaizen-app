@@ -112,6 +112,28 @@ export class MemoryStore {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        opened_ts INTEGER NOT NULL,
+        closed_ts INTEGER,
+        strategy TEXT NOT NULL,
+        chain_id INTEGER NOT NULL,
+        sell_token TEXT NOT NULL,
+        buy_token TEXT NOT NULL,
+        entry_usd REAL NOT NULL,
+        exit_usd REAL,
+        pnl_usd REAL,
+        open_tx TEXT,
+        close_tx TEXT,
+        reason_open TEXT,
+        reason_close TEXT,
+        metadata TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_pos_open ON positions(opened_ts DESC);
+      CREATE INDEX IF NOT EXISTS idx_pos_strategy ON positions(strategy, opened_ts DESC);
+      CREATE INDEX IF NOT EXISTS idx_pos_status
+        ON positions(closed_ts) WHERE closed_ts IS NULL;
     `);
   }
 
@@ -199,4 +221,75 @@ export class MemoryStore {
       .prepare("SELECT key, value, updated_at AS updatedAt FROM facts ORDER BY key")
       .all() as Fact[];
   }
+
+  // ── positions ─────────────────────────────────────────────────────
+  openPosition(p: Omit<Position, "id" | "closedTs" | "exitUsd" | "pnlUsd" | "closeTx" | "reasonClose">): number {
+    const info = this.db.prepare(
+      "INSERT INTO positions " +
+      "(opened_ts, strategy, chain_id, sell_token, buy_token, entry_usd, open_tx, reason_open, metadata) " +
+      "VALUES (?,?,?,?,?,?,?,?,?)",
+    ).run(
+      p.openedTs, p.strategy, p.chainId, p.sellToken, p.buyToken,
+      p.entryUsd, p.openTx ?? null, p.reasonOpen ?? null, p.metadata ?? null,
+    );
+    return Number(info.lastInsertRowid);
+  }
+
+  closePosition(id: number, patch: { closedTs: number; exitUsd: number; pnlUsd: number; closeTx?: string; reasonClose?: string }): void {
+    this.db.prepare(
+      "UPDATE positions SET closed_ts = ?, exit_usd = ?, pnl_usd = ?, close_tx = ?, reason_close = ? WHERE id = ?",
+    ).run(
+      patch.closedTs, patch.exitUsd, patch.pnlUsd,
+      patch.closeTx ?? null, patch.reasonClose ?? null, id,
+    );
+  }
+
+  openPositions(strategy?: string): Position[] {
+    const rows = strategy
+      ? this.db.prepare(
+          "SELECT id, opened_ts AS openedTs, closed_ts AS closedTs, strategy, chain_id AS chainId, " +
+          "sell_token AS sellToken, buy_token AS buyToken, entry_usd AS entryUsd, exit_usd AS exitUsd, " +
+          "pnl_usd AS pnlUsd, open_tx AS openTx, close_tx AS closeTx, reason_open AS reasonOpen, " +
+          "reason_close AS reasonClose, metadata FROM positions " +
+          "WHERE closed_ts IS NULL AND strategy = ? ORDER BY opened_ts DESC",
+        ).all(strategy)
+      : this.db.prepare(
+          "SELECT id, opened_ts AS openedTs, closed_ts AS closedTs, strategy, chain_id AS chainId, " +
+          "sell_token AS sellToken, buy_token AS buyToken, entry_usd AS entryUsd, exit_usd AS exitUsd, " +
+          "pnl_usd AS pnlUsd, open_tx AS openTx, close_tx AS closeTx, reason_open AS reasonOpen, " +
+          "reason_close AS reasonClose, metadata FROM positions " +
+          "WHERE closed_ts IS NULL ORDER BY opened_ts DESC",
+        ).all();
+    return rows as Position[];
+  }
+
+  strategyStats(strategy: string): { trades: number; wins: number; grossProfit: number; grossLoss: number; netProfit: number } {
+    const r = this.db.prepare(
+      "SELECT COUNT(*) AS trades, " +
+      "SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins, " +
+      "COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END), 0) AS grossProfit, " +
+      "COALESCE(SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END), 0) AS grossLoss, " +
+      "COALESCE(SUM(pnl_usd), 0) AS netProfit " +
+      "FROM positions WHERE strategy = ? AND closed_ts IS NOT NULL",
+    ).get(strategy) as { trades: number; wins: number; grossProfit: number; grossLoss: number; netProfit: number };
+    return r;
+  }
+}
+
+export interface Position {
+  id?: number;
+  openedTs: number;
+  closedTs?: number | null;
+  strategy: string;
+  chainId: number;
+  sellToken: string;
+  buyToken: string;
+  entryUsd: number;
+  exitUsd?: number | null;
+  pnlUsd?: number | null;
+  openTx?: string | null;
+  closeTx?: string | null;
+  reasonOpen?: string | null;
+  reasonClose?: string | null;
+  metadata?: string | null;
 }

@@ -25,6 +25,12 @@ import { ToolRegistry } from "../src/tools/registry.js";
 import { makeGetBalanceTool, makeTransferTool } from "../src/tools/wallet.js";
 import { makeQuoteTool } from "../src/tools/exchange.js";
 import { makeCreateImageTool, makeCreateVideoTool } from "../src/tools/kame.js";
+import {
+  makeOpenPositionTool,
+  makeClosePositionTool,
+  makeGetPositionsTool,
+} from "../src/tools/trading.js";
+import { makePredictListTool } from "../src/tools/predict.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -56,6 +62,10 @@ function makeApp() {
   tools.register(makeQuoteTool());
   tools.register(makeCreateImageTool());
   tools.register(makeCreateVideoTool());
+  tools.register(makeOpenPositionTool());
+  tools.register(makeClosePositionTool());
+  tools.register(makeGetPositionsTool());
+  tools.register(makePredictListTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
 
