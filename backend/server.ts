@@ -1,0 +1,155 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  Kaizen — HTTP API (backend)
+//
+//  Minimal Express server exposing:
+//    POST /agents                       create a new agent
+//    GET  /agents                       list all agents
+//    GET  /agents/:id                   agent record + on-chain balances + snapshot
+//    GET  /agents/:id/events            recent economic events
+//    GET  /agents/:id/turns             recent conversation turns
+//    POST /agents/:id/tick              run one Decision Loop tick
+//
+//  Bind to 127.0.0.1 by default — this is the agent runtime, not a
+//  public API. The Dashboard UI (Vite dev server) talks to it locally.
+// ═══════════════════════════════════════════════════════════════════════
+
+import express from "express";
+import cors from "cors";
+import { createAgent } from "../src/agent/identity.js";
+import { FileAgentRegistry } from "../src/agent/registry.js";
+import { snapshot, proposeBudget } from "../src/brain/economic.js";
+import { MemoryStore } from "../src/memory/store.js";
+import { DecisionLoop } from "../src/brain/decisionLoop.js";
+import { llmFromEnv } from "../src/brain/llm.js";
+import { ToolRegistry } from "../src/tools/registry.js";
+import { makeGetBalanceTool, makeTransferTool } from "../src/tools/wallet.js";
+import { makeQuoteTool } from "../src/tools/exchange.js";
+import { FileVaultStore } from "./wallet/vaultStore.js";
+import { SecureWalletService } from "./wallet/service.js";
+import { ComposedStateLoader } from "./wallet/stateLoader.js";
+
+const PORT = Number(process.env.KAIZEN_PORT || 4711);
+const HOST = process.env.KAIZEN_HOST || "127.0.0.1";
+const POL_USD_RATE = Number(process.env.KAIZEN_POL_USD_RATE || 0.5);
+
+function requirePassphrase(): string {
+  const p = process.env.KAIZEN_VAULT_PASSPHRASE;
+  if (!p || p.length < 16) {
+    throw new Error("KAIZEN_VAULT_PASSPHRASE env var missing or too short (≥16 chars).");
+  }
+  return p;
+}
+
+function makeApp() {
+  const passphrase = requirePassphrase();
+
+  const registry = new FileAgentRegistry();
+  const vault = new FileVaultStore();
+  const stateLoader = new ComposedStateLoader(registry, POL_USD_RATE);
+  const walletService = new SecureWalletService(vault, stateLoader);
+
+  const tools = new ToolRegistry();
+  tools.register(makeGetBalanceTool(walletService));
+  tools.register(makeTransferTool(walletService));
+  tools.register(makeQuoteTool());
+
+  const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
+
+  const app = express();
+  app.use(express.json({ limit: "256kb" }));
+  app.use(cors({ origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ }));
+
+  app.get("/healthz", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+  // ── Agents CRUD ──────────────────────────────────────────────────
+  app.post("/agents", async (req, res) => {
+    try {
+      const { displayName, agentId } = req.body ?? {};
+      if (!displayName) return res.status(400).json({ error: "displayName required" });
+      const out = await createAgent({ displayName, agentId }, vault, registry, passphrase);
+      res.json(out);
+    } catch (e) {
+      res.status(400).json({ error: (e as Error).message });
+    }
+  });
+
+  app.get("/agents", async (_req, res) => {
+    const all = await registry.list();
+    res.json({ agents: all });
+  });
+
+  app.get("/agents/:id", async (req, res) => {
+    try {
+      const record = await registry.get(req.params.id);
+      if (!record) return res.status(404).json({ error: "not found" });
+      const balances = await walletService.readBalances(req.params.id);
+      const snap = snapshot(
+        req.params.id,
+        { usdc: balances.usdc, pol: balances.pol, polUsdRate: POL_USD_RATE },
+        [],
+        { outflow24hUsd: 0, outflow7dUsd: 0 },
+        record.peakNetWorthUsd,
+      );
+      const budget = proposeBudget(snap.netWorthUsd, snap.suggestedStatus);
+      res.json({ record, balances, snapshot: snap, budget });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  app.get("/agents/:id/events", async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 50), 500);
+    const mem = new MemoryStore(req.params.id);
+    try {
+      res.json({ events: mem.recentEvents(limit) });
+    } finally {
+      mem.close();
+    }
+  });
+
+  app.get("/agents/:id/turns", async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 30), 200);
+    const mem = new MemoryStore(req.params.id);
+    try {
+      res.json({ turns: mem.recentTurns(limit) });
+    } finally {
+      mem.close();
+    }
+  });
+
+  app.post("/agents/:id/tick", async (req, res) => {
+    try {
+      const record = await registry.get(req.params.id);
+      if (!record) return res.status(404).json({ error: "not found" });
+      const balances = await walletService.readBalances(req.params.id);
+      const agentState = await stateLoader.load(req.params.id);
+      const result = await decisionLoop.tick({
+        agentId: req.params.id,
+        operatorPrompt: req.body?.operatorPrompt,
+        balances: { usdc: balances.usdc, pol: balances.pol, polUsdRate: POL_USD_RATE },
+        agentState,
+      });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  return app;
+}
+
+function main(): void {
+  const app = makeApp();
+  app.listen(PORT, HOST, () => {
+    console.log(`Kaizen backend listening on http://${HOST}:${PORT}`);
+    console.log(`  → GET  /healthz`);
+    console.log(`  → POST /agents               { displayName }`);
+    console.log(`  → GET  /agents`);
+    console.log(`  → GET  /agents/:id`);
+    console.log(`  → GET  /agents/:id/events`);
+    console.log(`  → GET  /agents/:id/turns`);
+    console.log(`  → POST /agents/:id/tick      { operatorPrompt? }`);
+  });
+}
+
+main();
