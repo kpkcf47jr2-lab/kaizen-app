@@ -43,6 +43,16 @@ import {
   makeAnalyzeProductTool,
   makeCreateListingTool,
 } from "../src/tools/commerce.js";
+import {
+  makeCreateCampaignTool,
+  makeRecordSpendTool,
+  makeRecordRevenueTool,
+  makeRoasTool,
+} from "../src/tools/marketing.js";
+import {
+  makeTwitterPostTool,
+  makeTelegramPostTool,
+} from "../src/tools/social.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -90,6 +100,12 @@ function makeApp() {
   tools.register(makeDiscoverProductsTool());
   tools.register(makeAnalyzeProductTool());
   tools.register(makeCreateListingTool());
+  tools.register(makeCreateCampaignTool());
+  tools.register(makeRecordSpendTool());
+  tools.register(makeRecordRevenueTool());
+  tools.register(makeRoasTool());
+  tools.register(makeTwitterPostTool());
+  tools.register(makeTelegramPostTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
 
