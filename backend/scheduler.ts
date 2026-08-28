@@ -25,6 +25,7 @@ import type { SecureWalletService } from "./wallet/service.js";
 import type { AgentStateLoader } from "./wallet/service.js";
 import { MemoryStore } from "../src/memory/store.js";
 import { evaluateExit } from "../src/brain/exitRules.js";
+import { markPositionUsd } from "../src/brain/priceOracle.js";
 
 export interface SchedulerConfig {
   /** How often the scheduler polls the registry for due agents (seconds). */
@@ -109,18 +110,15 @@ export class AutoTickScheduler {
   }
 
   /**
-   * For each open position with exit rules attached, mark-to-market via a
-   * quote call and check if any rule triggers. If so, record trade_close +
-   * emit an event; the actual sell-side swap is handled by the LLM next
-   * tick (it sees the closed position + queued swap intent). This keeps
-   * the auto-close side-effect-free at the on-chain level — no gas spent
-   * from the scheduler thread, only DB writes.
+   * For each open position with exit rules attached, mark-to-market via the
+   * Kairos Router, evaluate every rule, and if any triggers, record an
+   * intent event so the next LLM tick executes the sell-side swap. The
+   * scheduler itself doesn't spend gas — it just decides when to close.
    *
-   * MVP simplification: we don't have a live mark-to-market oracle yet.
-   * We can only fire trailing-stop watermark updates using the entry as
-   * current (no-op) OR we can trust the LLM to close on the next tick
-   * when it sees the rule was set. When exchange.quote or a price feed
-   * is wired in, this method actually starts closing positions.
+   * Positions without buyTokenDecimals or entryPriceUsd skip mark-to-market
+   * (we can't compute ROI). Populated correctly by trading.openPosition
+   * going forward; legacy positions from before this migration are logged
+   * once and then ignored.
    */
   private async autoCloseIfTriggered(agentId: string): Promise<void> {
     const mem = new MemoryStore(agentId);
@@ -130,25 +128,38 @@ export class AutoTickScheduler {
         if (!p.id) continue;
         const rules = mem.getExitRules(p.id);
         if (!rules) continue;
-        // Placeholder mark: entryUsd (no price feed yet). Will not trigger
-        // TP/SL, only tracks watermark once we have live pricing.
-        const currentUsd = p.entryUsd;
-        const decision = evaluateExit(p.entryUsd, currentUsd, rules);
+
+        // Skip legacy positions missing the snapshot fields — can't mark.
+        if (!p.buyTokenDecimals || !p.entryPriceUsd) continue;
+
+        const mark = await markPositionUsd({
+          chainId: p.chainId,
+          buyToken: p.buyToken,
+          buyTokenDecimals: p.buyTokenDecimals,
+          entryUsd: p.entryUsd,
+          entryPriceUsd: p.entryPriceUsd,
+        });
+        if (!mark) continue; // router temporarily unavailable — retry next poll
+
+        const decision = evaluateExit(p.entryUsd, mark.currentUsd, rules);
         if (decision.newHighWatermark !== null) {
           mem.updateHighWatermark(p.id, decision.newHighWatermark);
         }
         if (decision.shouldClose) {
           console.log(
-            `[scheduler] ${agentId} auto-close position ${p.id}: ${decision.reason}`,
+            `[scheduler] ${agentId} auto-close position ${p.id}: ${decision.reason} (mark $${mark.currentUsd.toFixed(2)} vs entry $${p.entryUsd.toFixed(2)}, ROI ${mark.roiPct.toFixed(2)}%)`,
           );
           mem.recordEvent({
             ts: Date.now(),
-            kind: "policy_violation", // TODO: add "auto_exit_triggered" kind after schema migration
+            kind: "policy_violation", // TODO enum-migrate to auto_exit_triggered
             reason: `auto_exit: ${decision.reason}`,
-            metadata: JSON.stringify({ positionId: p.id, triggered: decision.triggered }),
+            metadata: JSON.stringify({
+              positionId: p.id,
+              triggered: decision.triggered,
+              markUsd: mark.currentUsd,
+              roiPct: mark.roiPct,
+            }),
           });
-          // NOTE: actual position close happens next LLM tick. We flag it in
-          // the ledger so the LLM's briefing surfaces the intent.
         }
       }
     } finally { mem.close(); }

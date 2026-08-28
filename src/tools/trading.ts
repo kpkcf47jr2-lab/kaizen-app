@@ -101,7 +101,10 @@ export function makeSetExitRulesTool(): RegisteredTool<SetExitRulesArgs, SetExit
 export interface OpenPositionArgs {
   strategy: string;
   buyToken: string;
+  buyTokenDecimals: number;      // required so scheduler mark-to-market works
+  chainId?: number;              // default 137 (Polygon)
   entryUsd: number;
+  entryPriceUsd?: number;        // USD per whole token at open; enables TP/SL
   reason: string;
 }
 
@@ -119,10 +122,12 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
       const id = mem.openPosition({
         openedTs: Date.now(),
         strategy: args.strategy,
-        chainId: 137,
+        chainId: args.chainId ?? 137,
         sellToken: "USDC",
         buyToken: args.buyToken,
+        buyTokenDecimals: args.buyTokenDecimals,
         entryUsd: args.entryUsd,
+        entryPriceUsd: args.entryPriceUsd ?? null,
         reasonOpen: args.reason,
       });
       mem.recordEvent({
@@ -131,7 +136,12 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
         strategy: args.strategy,
         amountUsd: args.entryUsd,
         reason: args.reason,
-        metadata: JSON.stringify({ positionId: id, buyToken: args.buyToken }),
+        metadata: JSON.stringify({
+          positionId: id,
+          buyToken: args.buyToken,
+          chainId: args.chainId ?? 137,
+          entryPriceUsd: args.entryPriceUsd ?? null,
+        }),
       });
       return { ok: true, positionId: id, strategy: args.strategy, entryUsd: args.entryUsd };
     } finally { mem.close(); }
@@ -145,11 +155,14 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
         "named strategy. Records to the positions table and emits a trade_open " +
         "event. Follow up in a subsequent tick with exchange.quote + " +
         "wallet.transfer to actually execute. Use this to keep the strategy " +
-        "book of record separate from wallet mechanics.",
+        "book of record separate from wallet mechanics.\n\n" +
+        "IMPORTANT: pass entryPriceUsd (USD per whole token, from exchange.quote " +
+        "you called moments ago) so the scheduler can mark-to-market for TP/SL " +
+        "evaluation. Without it, trading.setExitRules is a no-op.",
       level: PermissionLevel.FINANCIAL,
       parameters: {
         type: "object",
-        required: ["strategy", "buyToken", "entryUsd", "reason"],
+        required: ["strategy", "buyToken", "buyTokenDecimals", "entryUsd", "reason"],
         properties: {
           strategy: {
             type: "string",
@@ -161,9 +174,22 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
             type: "string",
             description: "ERC-20 address of the token you're buying with USDC.",
           },
+          buyTokenDecimals: {
+            type: "number",
+            description: "Decimals of buyToken (usually 18 for altcoins, 6 for USDC/USDT). Required for mark-to-market.",
+          },
+          chainId: {
+            type: "number",
+            enum: [137, 8453],
+            description: "137 Polygon (default) or 8453 Base.",
+          },
           entryUsd: {
             type: "number",
             description: "USDC amount you plan to commit. Must fit within self-defined trading budget.",
+          },
+          entryPriceUsd: {
+            type: "number",
+            description: "USD per one whole buyToken at open. Take from exchange.quote's buyAmount / sellAmount immediately before this call.",
           },
           reason: {
             type: "string",

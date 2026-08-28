@@ -121,7 +121,9 @@ export class MemoryStore {
         chain_id INTEGER NOT NULL,
         sell_token TEXT NOT NULL,
         buy_token TEXT NOT NULL,
+        buy_token_decimals INTEGER,
         entry_usd REAL NOT NULL,
+        entry_price_usd REAL,
         exit_usd REAL,
         pnl_usd REAL,
         open_tx TEXT,
@@ -135,6 +137,10 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_pos_status
         ON positions(closed_ts) WHERE closed_ts IS NULL;
 
+      -- Additive migrations for positions (idempotent — ADD COLUMN throws if
+      -- exists; caught in TS below).
+      -- (no-op placeholder; actual ALTER handled in migrate() below)
+
       -- Exit rules on open positions. Populated by trading.openPosition when
       -- the LLM sets stop-loss / take-profit at open. The scheduler evaluates
       -- these against current price without invoking the LLM — fast + cheap.
@@ -147,6 +153,21 @@ export class MemoryStore {
         high_watermark_usd REAL,
         updated_at INTEGER NOT NULL
       );
+    `);
+
+    // Idempotent additive migrations — SQLite raises "duplicate column" if
+    // the column already exists, caught + ignored.
+    for (const alter of [
+      "ALTER TABLE positions ADD COLUMN buy_token_decimals INTEGER",
+      "ALTER TABLE positions ADD COLUMN entry_price_usd REAL",
+    ]) {
+      try { this.db.exec(alter); }
+      catch (e) { if (!/duplicate column/i.test(String(e))) throw e; }
+    }
+
+    this.db.exec(`
+      -- Marker for later — keeps migrate() re-callable without side effects.
+      SELECT 1;
 
       CREATE TABLE IF NOT EXISTS opportunities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,11 +278,14 @@ export class MemoryStore {
   openPosition(p: Omit<Position, "id" | "closedTs" | "exitUsd" | "pnlUsd" | "closeTx" | "reasonClose">): number {
     const info = this.db.prepare(
       "INSERT INTO positions " +
-      "(opened_ts, strategy, chain_id, sell_token, buy_token, entry_usd, open_tx, reason_open, metadata) " +
-      "VALUES (?,?,?,?,?,?,?,?,?)",
+      "(opened_ts, strategy, chain_id, sell_token, buy_token, buy_token_decimals, " +
+      "entry_usd, entry_price_usd, open_tx, reason_open, metadata) " +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     ).run(
       p.openedTs, p.strategy, p.chainId, p.sellToken, p.buyToken,
-      p.entryUsd, p.openTx ?? null, p.reasonOpen ?? null, p.metadata ?? null,
+      p.buyTokenDecimals ?? null,
+      p.entryUsd, p.entryPriceUsd ?? null,
+      p.openTx ?? null, p.reasonOpen ?? null, p.metadata ?? null,
     );
     return Number(info.lastInsertRowid);
   }
@@ -276,20 +300,18 @@ export class MemoryStore {
   }
 
   openPositions(strategy?: string): Position[] {
+    const cols =
+      "id, opened_ts AS openedTs, closed_ts AS closedTs, strategy, chain_id AS chainId, " +
+      "sell_token AS sellToken, buy_token AS buyToken, buy_token_decimals AS buyTokenDecimals, " +
+      "entry_usd AS entryUsd, entry_price_usd AS entryPriceUsd, exit_usd AS exitUsd, " +
+      "pnl_usd AS pnlUsd, open_tx AS openTx, close_tx AS closeTx, reason_open AS reasonOpen, " +
+      "reason_close AS reasonClose, metadata";
     const rows = strategy
       ? this.db.prepare(
-          "SELECT id, opened_ts AS openedTs, closed_ts AS closedTs, strategy, chain_id AS chainId, " +
-          "sell_token AS sellToken, buy_token AS buyToken, entry_usd AS entryUsd, exit_usd AS exitUsd, " +
-          "pnl_usd AS pnlUsd, open_tx AS openTx, close_tx AS closeTx, reason_open AS reasonOpen, " +
-          "reason_close AS reasonClose, metadata FROM positions " +
-          "WHERE closed_ts IS NULL AND strategy = ? ORDER BY opened_ts DESC",
+          `SELECT ${cols} FROM positions WHERE closed_ts IS NULL AND strategy = ? ORDER BY opened_ts DESC`,
         ).all(strategy)
       : this.db.prepare(
-          "SELECT id, opened_ts AS openedTs, closed_ts AS closedTs, strategy, chain_id AS chainId, " +
-          "sell_token AS sellToken, buy_token AS buyToken, entry_usd AS entryUsd, exit_usd AS exitUsd, " +
-          "pnl_usd AS pnlUsd, open_tx AS openTx, close_tx AS closeTx, reason_open AS reasonOpen, " +
-          "reason_close AS reasonClose, metadata FROM positions " +
-          "WHERE closed_ts IS NULL ORDER BY opened_ts DESC",
+          `SELECT ${cols} FROM positions WHERE closed_ts IS NULL ORDER BY opened_ts DESC`,
         ).all();
     return rows as Position[];
   }
@@ -400,7 +422,10 @@ export interface Position {
   chainId: number;
   sellToken: string;
   buyToken: string;
+  buyTokenDecimals?: number | null;
   entryUsd: number;
+  /** USD per one whole unit of buyToken at open time. Enables mark-to-market. */
+  entryPriceUsd?: number | null;
   exitUsd?: number | null;
   pnlUsd?: number | null;
   openTx?: string | null;
