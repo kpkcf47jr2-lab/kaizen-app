@@ -61,14 +61,21 @@ export class LLMClient {
 
   async chat(messages: ChatMessage[], tools?: ToolSchema[]): Promise<LLMResponse> {
     const url = `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`;
+
+    // Some providers (DeepSeek on NIM) reject '.' in function names.
+    // We use dotted names internally (wallet.getBalance) for readability
+    // and OpenAI/Anthropic parity — sanitize outbound + reverse inbound so
+    // the rest of the code keeps the dotted convention.
+    const sanitized = tools?.map(sanitizeToolSchema);
+
     const body: Record<string, unknown> = {
       model: this.cfg.model,
       messages,
       temperature: this.cfg.temperature ?? 0.2,
       max_tokens: this.cfg.maxTokens ?? 1024,
     };
-    if (tools && tools.length > 0) {
-      body.tools = tools;
+    if (sanitized && sanitized.length > 0) {
+      body.tools = sanitized;
       body.tool_choice = "auto";
     }
 
@@ -106,9 +113,19 @@ export class LLMClient {
     const choice = data.choices?.[0];
     if (!choice) throw new Error("LLM returned no choices");
 
+    // Reverse the wire-name sanitation so downstream code sees the
+    // dotted tool names it registered.
+    const toolCalls = (choice.message.tool_calls ?? []).map((tc) => ({
+      ...tc,
+      function: {
+        ...tc.function,
+        name: desanitizeName(tc.function.name),
+      },
+    }));
+
     return {
       content: choice.message.content,
-      toolCalls: choice.message.tool_calls ?? [],
+      toolCalls,
       finishReason: choice.finish_reason,
       usage: data.usage && {
         prompt: data.usage.prompt_tokens,
@@ -117,6 +134,25 @@ export class LLMClient {
       },
     };
   }
+}
+
+// ── tool-name sanitation ─────────────────────────────────────────────
+// Wire: dots → double underscore (reversible unambiguous transform).
+// Registered names never contain "__" themselves.
+function sanitizeName(name: string): string {
+  return name.replace(/\./g, "__");
+}
+function desanitizeName(name: string): string {
+  return name.replace(/__/g, ".");
+}
+function sanitizeToolSchema(t: ToolSchema): ToolSchema {
+  return {
+    type: "function",
+    function: {
+      ...t.function,
+      name: sanitizeName(t.function.name),
+    },
+  };
 }
 
 /** Load defaults from env. Falls back to NVIDIA NIM which the Kairos ecosystem already uses. */
