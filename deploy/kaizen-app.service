@@ -1,0 +1,38 @@
+[Unit]
+Description=Kaizen AI backend (autonomous entrepreneur agent runtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kaizen
+Group=kaizen
+WorkingDirectory=/opt/kaizen-app
+
+# Env file — see deploy/.env.production.example. NEVER commit real .env.
+EnvironmentFile=/etc/kaizen-app.env
+
+# Run via tsx (no build step; TypeScript source directly). If you'd rather
+# pre-compile, swap to: ExecStart=/usr/bin/node dist/backend/server.js
+ExecStart=/usr/bin/npx tsx backend/server.ts
+
+# Ports bound in-app via KAIZEN_HOST + KAIZEN_PORT env vars.
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Resource + hardening
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kaizen-app/data
+
+# Logs go to journalctl -u kaizen-app
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
