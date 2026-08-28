@@ -132,6 +132,38 @@ function makeApp() {
 
   app.get("/healthz", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
+  // Root handler — useful when someone opens the base URL in a browser and
+  // otherwise gets Express's default "Cannot GET /" 404.
+  app.get("/", (_req, res) => res.json({
+    service: "Kaizen AI",
+    version: "0.2",
+    company: "Kaizen LLC",
+    note: "Backend HTTP API. Every route is JSON. No HTML pages on this host.",
+    endpoints: {
+      "GET  /healthz":              "liveness probe",
+      "GET  /agents":               "list agents",
+      "POST /agents":               "create agent  { displayName, agentId? }",
+      "GET  /agents/:id":           "agent record + on-chain balances + snapshot + budget",
+      "GET  /agents/:id/events":    "recent economic events",
+      "GET  /agents/:id/turns":     "recent conversation turns",
+      "POST /agents/:id/schedule":  "toggle auto-tick { enabled, intervalSeconds }",
+      "POST /agents/:id/tick":      "run one Decision Loop tick (LLM ~30-60s)",
+    },
+    tools: {
+      wallet: ["getBalance", "transfer"],
+      exchange: ["quote"],
+      kame: ["createImage", "createVideo"],
+      trading: ["openPosition", "closePosition", "getPositions", "setExitRules"],
+      predict: ["list"],
+      opportunity: ["scan", "recent", "markActed"],
+      reinvest: ["plan", "apply"],
+      commerce: ["discoverProducts", "analyzeProduct", "createListing"],
+      marketing: ["createCampaign", "recordSpend", "recordRevenue", "roas"],
+      social: ["twitter.postTweet", "telegram.postMessage"],
+    },
+    ts: Date.now(),
+  }));
+
   // ── Agents CRUD ──────────────────────────────────────────────────
   app.post("/agents", async (req, res) => {
     try {
