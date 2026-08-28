@@ -89,7 +89,10 @@ function makeApp() {
       pollIntervalSeconds: Number(process.env.KAIZEN_SCHEDULER_POLL_SEC || "30"),
       maxConcurrent: Number(process.env.KAIZEN_SCHEDULER_CONCURRENCY || "3"),
       minTickIntervalSeconds: 60,
-      polUsdRate: POL_USD_RATE,
+      nativeUsdRates: {
+        137: POL_USD_RATE,
+        8453: Number(process.env.KAIZEN_ETH_USD_RATE || 3200),
+      },
     },
   );
   scheduler.start();
@@ -122,9 +125,19 @@ function makeApp() {
       const record = await registry.get(req.params.id);
       if (!record) return res.status(404).json({ error: "not found" });
       const balances = await walletService.readBalances(req.params.id);
+      // Owner-flagged 2026-08-28: snapshot() used to receive a single scalar
+      // polUsdRate and multiply every chain's native by it — ETH on Base was
+      // being valued as if it were POL, so 0.00081 ETH ($2.60) showed up as
+      // gas=$0.00. Now we compute total gas USD across chains via stateLoader
+      // and pass it as (pol=totalGasUsd, polUsdRate=1) so snapshot arithmetic
+      // stays correct without changing its signature.
+      let gasUsdTotal = 0;
+      for (const [idStr, per] of Object.entries(balances.byChain)) {
+        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+      }
       const snap = snapshot(
         req.params.id,
-        { usdc: balances.usdc, pol: balances.pol, polUsdRate: POL_USD_RATE },
+        { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
         [],
         { outflow24hUsd: 0, outflow7dUsd: 0 },
         record.peakNetWorthUsd,
@@ -183,10 +196,16 @@ function makeApp() {
       if (!record) return res.status(404).json({ error: "not found" });
       const balances = await walletService.readBalances(req.params.id);
       const agentState = await stateLoader.load(req.params.id);
+      // Same fix as GET /agents/:id — compute total gas USD via per-chain
+      // rates instead of applying a single scalar polUsdRate to every native.
+      let gasUsdTotal = 0;
+      for (const [idStr, per] of Object.entries(balances.byChain)) {
+        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+      }
       const result = await decisionLoop.tick({
         agentId: req.params.id,
         operatorPrompt: req.body?.operatorPrompt,
-        balances: { usdc: balances.usdc, pol: balances.pol, polUsdRate: POL_USD_RATE },
+        balances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
         agentState,
       });
       res.json(result);

@@ -32,8 +32,12 @@ export interface SchedulerConfig {
   maxConcurrent?: number;
   /** Hard floor for any per-agent interval. */
   minTickIntervalSeconds?: number;
-  /** POL/USD used by the balances → snapshot pipeline. */
+  /** DEPRECATED, kept for backwards compat — use nativeUsdRates instead. */
   polUsdRate?: number;
+  /** Per-chain native USD rate map. Multiplied by on-chain native to get
+   *  gasReserveUsd in the snapshot. Without it, ETH on Base would be
+   *  priced as POL and the LLM would think it has $0 gas. */
+  nativeUsdRates?: Record<number, number>;
 }
 
 export class AutoTickScheduler {
@@ -102,12 +106,20 @@ export class AutoTickScheduler {
     try {
       const balances = await this.wallet.readBalances(a.agentId);
       const agentState = await this.stateLoader.load(a.agentId);
+      // Sum native × per-chain rate. Falls back to legacy polUsdRate if no
+      // map given (single-chain agents from before Base was whitelisted).
+      const rates = this.cfg.nativeUsdRates
+        ?? { 137: this.cfg.polUsdRate ?? 0.5, 8453: 3200 };
+      let gasUsdTotal = 0;
+      for (const [idStr, per] of Object.entries(balances.byChain || {})) {
+        gasUsdTotal += per.native * (rates[Number(idStr)] ?? 0);
+      }
       const result = await this.loop.tick({
         agentId: a.agentId,
         balances: {
           usdc: balances.usdc,
-          pol: balances.pol,
-          polUsdRate: this.cfg.polUsdRate ?? 0.5,
+          pol: gasUsdTotal,
+          polUsdRate: 1,
         },
         agentState,
       });

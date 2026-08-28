@@ -29,6 +29,25 @@ export class ComposedStateLoader implements AgentStateLoader {
     private readonly nativeUsdRates: Record<number, number> = { 137: 0.5, 8453: 3200 },
   ) {}
 
+  /** Convert an on-chain native amount to USD using the per-chain rate table. */
+  gasUsdFor(chainId: number, nativeAmount: number): number {
+    return nativeAmount * (this.nativeUsdRates[chainId] ?? 0);
+  }
+
+  /** Total gas value (USD) across every whitelisted chain for an address. */
+  async totalGasUsdFor(address: string): Promise<number> {
+    const chainIds = Object.keys(CHAINS).map(Number);
+    const perChain = await Promise.all(
+      chainIds.map(async (id) => {
+        const chain = CHAINS[id];
+        if (!chain) return 0;
+        const n = await nativeBalance(chain, address).catch(() => 0);
+        return n * (this.nativeUsdRates[id] ?? 0);
+      }),
+    );
+    return perChain.reduce((s, v) => s + v, 0);
+  }
+
   async load(agentId: string): Promise<AgentState> {
     const record = await this.registry.get(agentId);
     if (!record) throw new Error(`Agent ${agentId} not found`);
