@@ -58,7 +58,10 @@ function makeApp() {
 
   const registry = new FileAgentRegistry();
   const vault = new FileVaultStore();
-  const stateLoader = new ComposedStateLoader(registry, POL_USD_RATE);
+  const stateLoader = new ComposedStateLoader(registry, {
+    137: POL_USD_RATE,
+    8453: Number(process.env.KAIZEN_ETH_USD_RATE || 3200),
+  });
   const walletService = new SecureWalletService(vault, stateLoader);
 
   const tools = new ToolRegistry();

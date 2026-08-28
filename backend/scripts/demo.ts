@@ -54,16 +54,16 @@ async function main(): Promise<number> {
   }
   if (!record) throw new Error("registry.get returned null after upsert");
 
-  // 2. Read on-chain balances
-  const stateLoader = new ComposedStateLoader(reg, POL_USD_RATE);
+  // 2. Read on-chain balances (multi-chain)
+  const stateLoader = new ComposedStateLoader(reg, { 137: POL_USD_RATE, 8453: 3200 });
   const svc = new SecureWalletService(vault, stateLoader);
-  console.log("→ reading on-chain balances (Polygon)…");
-  const { address, usdc, pol } = await svc.readBalances(DEMO_AGENT_ID);
+  console.log("→ reading on-chain balances (Polygon 137 + Base 8453)…");
+  const { address, usdc, native, byChain } = await svc.readBalances(DEMO_AGENT_ID);
 
-  // 3. Snapshot
+  // 3. Snapshot — cash+native summed across chains
   const snap = snapshot(
     DEMO_AGENT_ID,
-    { usdc, pol, polUsdRate: POL_USD_RATE },
+    { usdc, pol: native, polUsdRate: 1 /* native already valued via rates above */ },
     [],
     { outflow24hUsd: 0, outflow7dUsd: 0 },
     record.peakNetWorthUsd,
@@ -83,10 +83,12 @@ async function main(): Promise<number> {
   console.log("├─────────────────────────────────────────────────");
   console.log(`│  Net worth:     $${snap.netWorthUsd.toFixed(2)}`);
   console.log(`│  Cash (USDC):   $${snap.cashUsd.toFixed(2)}`);
-  console.log(`│  Gas (POL):     $${snap.gasReserveUsd.toFixed(2)}  (${pol.toFixed(4)} POL)`);
-  console.log(`│  Invested:      $${snap.investedUsd.toFixed(2)}`);
   console.log(`│  Peak:          $${snap.peakNetWorthUsd.toFixed(2)}`);
   console.log(`│  Drawdown:      ${snap.drawdownPct.toFixed(1)}%`);
+  console.log("├── per-chain split ──────────────────────────────");
+  for (const [id, per] of Object.entries(byChain)) {
+    console.log(`│  chain ${id.padEnd(4)} : USDC $${per.usdc.toFixed(4)}  ·  ${per.native.toFixed(6)} ${per.nativeSymbol}`);
+  }
   console.log("├── proposed budget for this tick ─────────────────");
   console.log(`│  Reserve:            $${budget.reserveUsd}`);
   console.log(`│  Trading:            $${budget.tradingUsd}`);
@@ -96,8 +98,7 @@ async function main(): Promise<number> {
   console.log(`│  Experimentation:    $${budget.experimentationUsd}`);
   console.log("└─────────────────────────────────────────────────");
   console.log("");
-  console.log("Next: fund this address with USDC + POL on Polygon, rerun this");
-  console.log("script, and the numbers should update.");
+  console.log("Next: fund USDC + native (POL on Polygon, ETH on Base) at the address above.");
   return 0;
 }
 

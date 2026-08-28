@@ -7,15 +7,15 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 import {
-  nativeBalance,
   erc20Balance,
+  nativeBalance,
 } from "@kaizen/wallet-core";
 import type { AgentRegistry } from "../../src/agent/registry.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import type { AgentStateLoader } from "./service.js";
 import type { AgentState } from "../../src/policy/engine.js";
 import { PermissionLevel } from "../../src/policy/limits.js";
-import { POLYGON, USDC_POLYGON } from "./service.js";
+import { CHAINS, USDC_BY_CHAIN } from "./service.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -25,20 +25,37 @@ const MIN_MS = 60 * 1000;
 export class ComposedStateLoader implements AgentStateLoader {
   constructor(
     private readonly registry: AgentRegistry,
-    /** POL/USD from a price feed. MVP: hardcode; later inject a source. */
-    private readonly polUsdRate: number = 0.5,
+    /** USD rates for native tokens per chainId. MVP: hardcode; later a price feed. */
+    private readonly nativeUsdRates: Record<number, number> = { 137: 0.5, 8453: 3200 },
   ) {}
 
   async load(agentId: string): Promise<AgentState> {
     const record = await this.registry.get(agentId);
     if (!record) throw new Error(`Agent ${agentId} not found`);
 
-    const [usdcBal, polNative] = await Promise.all([
-      erc20Balance(POLYGON, USDC_POLYGON.address, record.address),
-      nativeBalance(POLYGON, record.address),
-    ]);
-    const cash = usdcBal.formatted;
-    const gas = polNative * this.polUsdRate;
+    // Sum USDC + native across every whitelisted chain. This is a repeat of
+    // SecureWalletService.readBalances(), duplicated here to avoid a circular
+    // dep (service depends on stateLoader). Keep the two in sync.
+    const chainIds = Object.keys(CHAINS).map(Number);
+    const perChain = await Promise.all(
+      chainIds.map(async (id) => {
+        const chain = CHAINS[id];
+        const usdc = USDC_BY_CHAIN[id];
+        if (!chain || !usdc) return { id, usdc: 0, native: 0 };
+        const [u, n] = await Promise.all([
+          erc20Balance(chain, usdc.address, record.address).catch(() => ({ formatted: 0 })),
+          nativeBalance(chain, record.address).catch(() => 0),
+        ]);
+        return { id, usdc: u.formatted, native: n };
+      }),
+    );
+
+    let cash = 0;
+    let gas = 0;
+    for (const r of perChain) {
+      cash += r.usdc;
+      gas += r.native * (this.nativeUsdRates[r.id] ?? 0);
+    }
     const net = cash + gas; // MVP: no open positions tracked yet
 
     const mem = new MemoryStore(agentId);

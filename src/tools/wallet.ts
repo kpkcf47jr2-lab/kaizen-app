@@ -20,24 +20,31 @@ import type { SecureWalletService } from "../../backend/wallet/service.js";
 interface GetBalanceArgs { /* no args */ }
 export interface GetBalanceResult {
   address: string;
+  /** Totals summed across all whitelisted chains. */
   usdc: number;
-  pol: number;
-  chain: "Polygon";
+  /** Sum of native across chains (POL + ETH etc). */
+  native: number;
+  /** Per-chain split so the agent can pick which chain to transact on. */
+  byChain: Record<number, { usdc: number; native: number; nativeSymbol: string }>;
 }
 
 export function makeGetBalanceTool(
   service: SecureWalletService,
 ): RegisteredTool<GetBalanceArgs, GetBalanceResult> {
   const exec: ToolFn<GetBalanceArgs, GetBalanceResult> = async (_args, ctx) => {
-    const { address, usdc, pol } = await service.readBalances(ctx.agentId);
-    return { address, usdc, pol, chain: "Polygon" };
+    const { address, usdc, native, byChain } = await service.readBalances(ctx.agentId);
+    return { address, usdc, native, byChain };
   };
 
   return {
     def: {
       name: "wallet.getBalance",
       description:
-        "Read the agent's on-chain balances (USDC and POL) on Polygon. No side effects.",
+        "Read the agent's on-chain balances across all whitelisted chains " +
+        "(Polygon 137 + Base 8453). Returns totals plus per-chain split " +
+        "under `byChain`. Call this before wallet.transfer / trading.* to " +
+        "know where the USDC lives and how much gas each chain has. " +
+        "Read-only, no cost.",
       level: PermissionLevel.READ_ONLY,
       parameters: { type: "object", properties: {} },
     },
@@ -55,6 +62,10 @@ export interface TransferArgs {
   destinationRole: string;
   amountUsdc: number;
   reason: string;
+  /** Which chain to send USDC on. Default 137 (Polygon).
+   *  Also accepted: 8453 (Base). Any other value is rejected by the
+   *  Secure Wallet Service before the policy check even runs. */
+  chainId?: number;
 }
 export interface TransferResult {
   txHash: string;
@@ -72,6 +83,7 @@ export function makeTransferTool(
       destinationRole: args.destinationRole,
       amountUsdc: args.amountUsdc,
       reason: args.reason,
+      chainId: args.chainId,
     });
     if (!result.ok) {
       throw new Error(`Policy rejected: ${result.reason}`);
@@ -87,9 +99,12 @@ export function makeTransferTool(
     def: {
       name: "wallet.transfer",
       description:
-        "Transfer USDC on Polygon from the agent's wallet to a whitelisted destination. " +
-        "Requires reason (recorded in the Economic Ledger). Rejected if it would breach " +
-        "any Policy Engine limit — the agent must not retry blindly.",
+        "Transfer USDC from the agent's wallet to a whitelisted destination. " +
+        "Works on Polygon (chainId=137, default) or Base (chainId=8453). " +
+        "Requires reason (recorded in the Economic Ledger). Rejected if it " +
+        "would breach any Policy Engine limit — the agent must not retry blindly. " +
+        "Pick chainId based on where the agent has USDC (call wallet.getBalance " +
+        "first — the byChain field shows the per-chain split).",
       level: PermissionLevel.FINANCIAL,
       parameters: {
         type: "object",
@@ -115,6 +130,11 @@ export function makeTransferTool(
               "Short justification recorded in the Economic Ledger. Required so " +
               "every transfer has an auditable purpose.",
           },
+          chainId: {
+            type: "number",
+            enum: [137, 8453],
+            description: "137 = Polygon (default). 8453 = Base.",
+          },
         },
       },
     },
@@ -124,7 +144,7 @@ export function makeTransferTool(
       level: PermissionLevel.FINANCIAL,
       valueUsd: a.amountUsdc,
       destinationRole: a.destinationRole,
-      chainId: 137,
+      chainId: a.chainId ?? 137,
     }),
   };
 }

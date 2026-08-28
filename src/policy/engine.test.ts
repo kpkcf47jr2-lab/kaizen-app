@@ -81,9 +81,20 @@ describe('PolicyEngine', () => {
       level: PermissionLevel.FINANCIAL,
       valueUsd: 10,
       destinationRole: 'known-vendor',
-      chainId: 1, // Ethereum not on the Polygon-only whitelist
+      chainId: 1, // Ethereum not in ALLOWED_CHAINS (currently [137, 8453])
     });
     expect(decision.allow).toBe(false);
+  });
+
+  it('allows tx on Base 8453 (added 2026-08-28)', () => {
+    const decision = engine.evaluate(mkAgent(), {
+      tool: 'wallet.transfer',
+      level: PermissionLevel.FINANCIAL,
+      valueUsd: 25,
+      destinationRole: 'known-vendor',
+      chainId: 8453,
+    });
+    expect(decision.allow).toBe(true);
   });
 
   it('rejects when adding tx would breach daily outflow cap', () => {

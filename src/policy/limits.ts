@@ -23,8 +23,11 @@ export const HARD_LIMITS = {
   /** Max total value moved in any rolling 7-day window. */
   MAX_WEEKLY_OUTFLOW_USD: 2_000,
 
-  /** Whitelist of chains the agent is allowed to touch. */
-  ALLOWED_CHAINS: [137] as const, // Polygon only — Kaizen settles USDC here.
+  /** Whitelist of chains the agent is allowed to touch. Owner-approved
+   *  2026-08-28: added Base 8453 because seed capital arrived there
+   *  (Circle-issued USDC natively supported). Kaizen may now hold/send
+   *  USDC on either chain; each transfer must specify a chainId. */
+  ALLOWED_CHAINS: [137, 8453] as const,
 
   /** Whitelist of destination address roles. Any tx to an address NOT
    *  matching one of these is rejected regardless of amount. */
