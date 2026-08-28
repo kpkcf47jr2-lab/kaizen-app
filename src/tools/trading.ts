@@ -27,6 +27,76 @@ import { PermissionLevel } from "../policy/limits.js";
 import type { RegisteredTool, ToolFn } from "./registry.js";
 import { MemoryStore, type Position } from "../memory/store.js";
 
+// ── trading.setExitRules ─────────────────────────────────────────────
+export interface SetExitRulesArgs {
+  positionId: number;
+  takeProfitPct?: number | null;   // close if roi ≥ +N%
+  stopLossPct?: number | null;     // close if roi ≤ -N% (positive number, magnitude)
+  trailingStopPct?: number | null; // close if drop from peak ≥ N%
+}
+export interface SetExitRulesResult {
+  ok: true;
+  positionId: number;
+  rules: {
+    takeProfitPct: number | null;
+    stopLossPct: number | null;
+    trailingStopPct: number | null;
+  };
+}
+
+export function makeSetExitRulesTool(): RegisteredTool<SetExitRulesArgs, SetExitRulesResult> {
+  const exec: ToolFn<SetExitRulesArgs, SetExitRulesResult> = async (args, ctx) => {
+    const mem = new MemoryStore(ctx.agentId);
+    try {
+      const open = mem.openPositions().find((p) => p.id === args.positionId);
+      if (!open) throw new Error(`Position ${args.positionId} not found or already closed`);
+      mem.setExitRules(args.positionId, {
+        takeProfitPct: args.takeProfitPct ?? null,
+        stopLossPct: args.stopLossPct ?? null,
+        trailingStopPct: args.trailingStopPct ?? null,
+        highWatermarkUsd: null,
+      });
+      return {
+        ok: true,
+        positionId: args.positionId,
+        rules: {
+          takeProfitPct: args.takeProfitPct ?? null,
+          stopLossPct: args.stopLossPct ?? null,
+          trailingStopPct: args.trailingStopPct ?? null,
+        },
+      };
+    } finally { mem.close(); }
+  };
+
+  return {
+    def: {
+      name: "trading.setExitRules",
+      description:
+        "Attach automatic exit rules to an open position — take-profit, " +
+        "stop-loss, trailing stop. The AutoTickScheduler evaluates these " +
+        "on every poll against current mark. When a rule triggers, the " +
+        "position is auto-closed without needing another LLM tick. Set " +
+        "at least one of the three; leave others null. Values are " +
+        "percentages (e.g. takeProfitPct=10 = close at +10% ROI, " +
+        "stopLossPct=5 = close at -5% ROI, trailingStopPct=3 = close if " +
+        "position drops 3% from its peak).",
+      level: PermissionLevel.ZERO_COST,
+      parameters: {
+        type: "object",
+        required: ["positionId"],
+        properties: {
+          positionId: { type: "number", description: "positions.id from trading.openPosition" },
+          takeProfitPct: { type: "number", description: "Close if ROI ≥ +N%. null to disable." },
+          stopLossPct: { type: "number", description: "Close if ROI ≤ -N% (positive magnitude). null to disable." },
+          trailingStopPct: { type: "number", description: "Close if drop from peak ≥ N%. null to disable." },
+        },
+      },
+    },
+    exec,
+    toIntent: () => ({ tool: "trading.setExitRules", level: PermissionLevel.ZERO_COST }),
+  };
+}
+
 // ── trading.openPosition ─────────────────────────────────────────────
 export interface OpenPositionArgs {
   strategy: string;

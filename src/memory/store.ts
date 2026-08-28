@@ -135,6 +135,19 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_pos_status
         ON positions(closed_ts) WHERE closed_ts IS NULL;
 
+      -- Exit rules on open positions. Populated by trading.openPosition when
+      -- the LLM sets stop-loss / take-profit at open. The scheduler evaluates
+      -- these against current price without invoking the LLM — fast + cheap.
+      -- Added 2026-08-28.
+      CREATE TABLE IF NOT EXISTS position_exit_rules (
+        position_id INTEGER PRIMARY KEY REFERENCES positions(id) ON DELETE CASCADE,
+        take_profit_pct REAL,
+        stop_loss_pct REAL,
+        trailing_stop_pct REAL,
+        high_watermark_usd REAL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS opportunities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         seen_ts INTEGER NOT NULL,
@@ -322,6 +335,60 @@ export class MemoryStore {
     this.db
       .prepare("UPDATE opportunities SET acted_on = 1, outcome = ? WHERE id = ?")
       .run(outcome ?? null, id);
+  }
+
+  // ── position exit rules ──────────────────────────────────────────
+
+  setExitRules(positionId: number, rules: {
+    takeProfitPct?: number | null;
+    stopLossPct?: number | null;
+    trailingStopPct?: number | null;
+    highWatermarkUsd?: number | null;
+  }): void {
+    this.db.prepare(
+      "INSERT INTO position_exit_rules " +
+      "(position_id, take_profit_pct, stop_loss_pct, trailing_stop_pct, high_watermark_usd, updated_at) " +
+      "VALUES (?,?,?,?,?,?) " +
+      "ON CONFLICT(position_id) DO UPDATE SET " +
+      "take_profit_pct=excluded.take_profit_pct, " +
+      "stop_loss_pct=excluded.stop_loss_pct, " +
+      "trailing_stop_pct=excluded.trailing_stop_pct, " +
+      "high_watermark_usd=excluded.high_watermark_usd, " +
+      "updated_at=excluded.updated_at",
+    ).run(
+      positionId,
+      rules.takeProfitPct ?? null,
+      rules.stopLossPct ?? null,
+      rules.trailingStopPct ?? null,
+      rules.highWatermarkUsd ?? null,
+      Date.now(),
+    );
+  }
+
+  getExitRules(positionId: number): {
+    takeProfitPct: number | null;
+    stopLossPct: number | null;
+    trailingStopPct: number | null;
+    highWatermarkUsd: number | null;
+  } | null {
+    const row = this.db.prepare(
+      "SELECT take_profit_pct AS takeProfitPct, stop_loss_pct AS stopLossPct, " +
+      "trailing_stop_pct AS trailingStopPct, high_watermark_usd AS highWatermarkUsd " +
+      "FROM position_exit_rules WHERE position_id = ?",
+    ).get(positionId) as {
+      takeProfitPct: number | null;
+      stopLossPct: number | null;
+      trailingStopPct: number | null;
+      highWatermarkUsd: number | null;
+    } | undefined;
+    return row ?? null;
+  }
+
+  updateHighWatermark(positionId: number, currentUsd: number): void {
+    this.db.prepare(
+      "UPDATE position_exit_rules SET high_watermark_usd = ?, updated_at = ? " +
+      "WHERE position_id = ? AND (high_watermark_usd IS NULL OR high_watermark_usd < ?)",
+    ).run(currentUsd, Date.now(), positionId, currentUsd);
   }
 }
 

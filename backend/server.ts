@@ -29,6 +29,7 @@ import {
   makeOpenPositionTool,
   makeClosePositionTool,
   makeGetPositionsTool,
+  makeSetExitRulesTool,
 } from "../src/tools/trading.js";
 import { makePredictListTool } from "../src/tools/predict.js";
 import {
@@ -36,6 +37,7 @@ import {
   makeRecentTool,
   makeMarkActedTool,
 } from "../src/tools/opportunity.js";
+import { makeReinvestPlanTool, makeReinvestApplyTool } from "../src/tools/reinvest.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -73,10 +75,13 @@ function makeApp() {
   tools.register(makeOpenPositionTool());
   tools.register(makeClosePositionTool());
   tools.register(makeGetPositionsTool());
+  tools.register(makeSetExitRulesTool());
   tools.register(makePredictListTool());
   tools.register(makeScanTool());
   tools.register(makeRecentTool());
   tools.register(makeMarkActedTool());
+  tools.register(makeReinvestPlanTool());
+  tools.register(makeReinvestApplyTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
 
