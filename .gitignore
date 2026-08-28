@@ -5,6 +5,11 @@ build/
 .env.local
 .env.*.local
 
+# Runtime state — vaults, agent registry, SQLite memory DBs.
+# NEVER commit this: contains encrypted mnemonics + on-chain history.
+data/
+!data/.gitkeep
+
 # Training artifacts
 datasets/raw/
 datasets/**/private_*.jsonl

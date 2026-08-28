@@ -1,0 +1,24 @@
+{
+  "name": "@kaizen/wallet-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Crypto primitives shared by the Kaizen agent, backend, and dashboard. Vendored from kairos-wallet vault module.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./vault": "./src/vault.ts",
+    "./identity": "./src/identity.ts",
+    "./signing": "./src/signing.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@scure/bip32": "^1.7.0",
+    "@scure/bip39": "^1.4.0",
+    "ethers": "^6.13.4"
+  }
+}

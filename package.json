@@ -10,13 +10,27 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "demo": "tsx backend/scripts/demo.ts"
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@kaizen/wallet-core": "*",
+    "@scure/bip32": "^1.7.0",
+    "@scure/bip39": "^1.4.0",
+    "better-sqlite3": "^11.3.0",
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.5"
   },
   "author": "Kaizen LLC",
   "license": "UNLICENSED"
