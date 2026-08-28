@@ -134,6 +134,24 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_pos_strategy ON positions(strategy, opened_ts DESC);
       CREATE INDEX IF NOT EXISTS idx_pos_status
         ON positions(closed_ts) WHERE closed_ts IS NULL;
+
+      CREATE TABLE IF NOT EXISTS opportunities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        seen_ts INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        signal_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        edge_usd_estimate REAL,
+        confidence REAL,
+        payload TEXT,
+        acted_on INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT,
+        UNIQUE(source, signal_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_opps_seen ON opportunities(seen_ts DESC);
+      CREATE INDEX IF NOT EXISTS idx_opps_open
+        ON opportunities(acted_on, seen_ts DESC) WHERE acted_on = 0;
     `);
   }
 
@@ -274,6 +292,37 @@ export class MemoryStore {
     ).get(strategy) as { trades: number; wins: number; grossProfit: number; grossLoss: number; netProfit: number };
     return r;
   }
+
+  // ── opportunities ────────────────────────────────────────────────
+  /** Insert-or-ignore. Returns id (new) or 0 (dupe on source+signalId). */
+  recordOpportunity(o: Omit<Opportunity, "id" | "actedOn" | "outcome">): number {
+    const info = this.db.prepare(
+      "INSERT OR IGNORE INTO opportunities " +
+      "(seen_ts, source, kind, signal_id, title, edge_usd_estimate, confidence, payload) " +
+      "VALUES (?,?,?,?,?,?,?,?)",
+    ).run(
+      o.seenTs, o.source, o.kind, o.signalId, o.title,
+      o.edgeUsdEstimate ?? null, o.confidence ?? null, o.payload ?? null,
+    );
+    return Number(info.lastInsertRowid);
+  }
+
+  recentOpportunities(limit = 20, unactedOnly = false): Opportunity[] {
+    const sql = unactedOnly
+      ? "SELECT id, seen_ts AS seenTs, source, kind, signal_id AS signalId, title, " +
+        "edge_usd_estimate AS edgeUsdEstimate, confidence, payload, acted_on AS actedOn, outcome " +
+        "FROM opportunities WHERE acted_on = 0 ORDER BY seen_ts DESC LIMIT ?"
+      : "SELECT id, seen_ts AS seenTs, source, kind, signal_id AS signalId, title, " +
+        "edge_usd_estimate AS edgeUsdEstimate, confidence, payload, acted_on AS actedOn, outcome " +
+        "FROM opportunities ORDER BY seen_ts DESC LIMIT ?";
+    return this.db.prepare(sql).all(limit) as Opportunity[];
+  }
+
+  markOpportunityActed(id: number, outcome?: string): void {
+    this.db
+      .prepare("UPDATE opportunities SET acted_on = 1, outcome = ? WHERE id = ?")
+      .run(outcome ?? null, id);
+  }
 }
 
 export interface Position {
@@ -292,4 +341,19 @@ export interface Position {
   reasonOpen?: string | null;
   reasonClose?: string | null;
   metadata?: string | null;
+}
+
+// ── Opportunities: signals surfaced by the Opportunity Engine ─────────
+export interface Opportunity {
+  id?: number;
+  seenTs: number;
+  source: string;              // "predict" | "trending" | "arb" | ...
+  kind: string;                // free-form: "binary-mispriced" | "momentum-24h" | ...
+  signalId: string;            // stable id from the source (dedupes on rescan)
+  title: string;               // one-line summary for the LLM briefing
+  edgeUsdEstimate?: number | null;
+  confidence?: number | null;  // 0-1
+  payload?: string | null;     // JSON — full source-specific data
+  actedOn?: number;            // 0 = fresh, 1 = the LLM decided to act on it
+  outcome?: string | null;
 }
