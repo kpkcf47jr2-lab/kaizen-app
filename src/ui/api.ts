@@ -13,6 +13,11 @@ export interface AgentRecord {
   createdAt: string;
   status: SurvivalStatus;
   peakNetWorthUsd: number;
+  autoTick?: {
+    enabled: boolean;
+    intervalSeconds: number;
+    lastTickTs?: number;
+  };
 }
 
 export interface Balances { address: string; usdc: number; pol: number }
@@ -118,4 +123,6 @@ export const api = {
     jget<{ turns: ConversationTurn[] }>(`/agents/${id}/turns?limit=${limit}`),
   tick: (id: string, operatorPrompt?: string) =>
     jpost<TickResult>(`/agents/${id}/tick`, { operatorPrompt }),
+  schedule: (id: string, enabled: boolean, intervalSeconds: number) =>
+    jpost<{ record: AgentRecord }>(`/agents/${id}/schedule`, { enabled, intervalSeconds }),
 };

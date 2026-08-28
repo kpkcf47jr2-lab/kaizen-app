@@ -27,6 +27,12 @@ export interface AgentRecord {
   createdAt: string;               // ISO
   status: SurvivalStatus;
   peakNetWorthUsd: number;
+  /** Autonomous scheduling. Missing = disabled by default. */
+  autoTick?: {
+    enabled: boolean;
+    intervalSeconds: number;       // ≥60; the scheduler clamps below.
+    lastTickTs?: number;           // updated after each successful tick
+  };
 }
 
 export interface AgentRegistry {
@@ -36,6 +42,7 @@ export interface AgentRegistry {
   upsert(record: AgentRecord): Promise<void>;
   updateStatus(agentId: string, status: SurvivalStatus): Promise<void>;
   updatePeak(agentId: string, peakUsd: number): Promise<void>;
+  updateAutoTick(agentId: string, config: NonNullable<AgentRecord["autoTick"]>): Promise<void>;
 }
 
 export class FileAgentRegistry implements AgentRegistry {
@@ -98,5 +105,15 @@ export class FileAgentRegistry implements AgentRegistry {
       all[agentId].peakNetWorthUsd = peakUsd;
       await this.writeAll(all);
     }
+  }
+
+  async updateAutoTick(
+    agentId: string,
+    config: NonNullable<AgentRecord["autoTick"]>,
+  ): Promise<void> {
+    const all = await this.readAll();
+    if (!all[agentId]) throw new Error(`Agent ${agentId} not found`);
+    all[agentId].autoTick = config;
+    await this.writeAll(all);
   }
 }

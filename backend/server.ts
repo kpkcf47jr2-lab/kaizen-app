@@ -24,9 +24,11 @@ import { llmFromEnv } from "../src/brain/llm.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import { makeGetBalanceTool, makeTransferTool } from "../src/tools/wallet.js";
 import { makeQuoteTool } from "../src/tools/exchange.js";
+import { makeCreateImageTool, makeCreateVideoTool } from "../src/tools/kame.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
+import { AutoTickScheduler } from "./scheduler.js";
 
 const PORT = Number(process.env.KAIZEN_PORT || 4711);
 const HOST = process.env.KAIZEN_HOST || "127.0.0.1";
@@ -52,8 +54,24 @@ function makeApp() {
   tools.register(makeGetBalanceTool(walletService));
   tools.register(makeTransferTool(walletService));
   tools.register(makeQuoteTool());
+  tools.register(makeCreateImageTool());
+  tools.register(makeCreateVideoTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
+
+  const scheduler = new AutoTickScheduler(
+    registry,
+    decisionLoop,
+    walletService,
+    stateLoader,
+    {
+      pollIntervalSeconds: Number(process.env.KAIZEN_SCHEDULER_POLL_SEC || "30"),
+      maxConcurrent: Number(process.env.KAIZEN_SCHEDULER_CONCURRENCY || "3"),
+      minTickIntervalSeconds: 60,
+      polUsdRate: POL_USD_RATE,
+    },
+  );
+  scheduler.start();
 
   const app = express();
   app.use(express.json({ limit: "256kb" }));
@@ -117,6 +135,27 @@ function makeApp() {
     }
   });
 
+  app.post("/agents/:id/schedule", async (req, res) => {
+    try {
+      const record = await registry.get(req.params.id);
+      if (!record) return res.status(404).json({ error: "not found" });
+      const { enabled, intervalSeconds } = req.body ?? {};
+      if (typeof enabled !== "boolean") {
+        return res.status(400).json({ error: "enabled (boolean) required" });
+      }
+      const interval = Math.max(60, Number(intervalSeconds) || 300);
+      await registry.updateAutoTick(req.params.id, {
+        enabled,
+        intervalSeconds: interval,
+        lastTickTs: record.autoTick?.lastTickTs,
+      });
+      const updated = await registry.get(req.params.id);
+      res.json({ record: updated });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
   app.post("/agents/:id/tick", async (req, res) => {
     try {
       const record = await registry.get(req.params.id);
@@ -135,21 +174,32 @@ function makeApp() {
     }
   });
 
-  return app;
+  return { app, scheduler };
 }
 
 function main(): void {
-  const app = makeApp();
-  app.listen(PORT, HOST, () => {
+  const { app, scheduler } = makeApp();
+  const server = app.listen(PORT, HOST, () => {
     console.log(`Kaizen backend listening on http://${HOST}:${PORT}`);
     console.log(`  → GET  /healthz`);
-    console.log(`  → POST /agents               { displayName }`);
+    console.log(`  → POST /agents                  { displayName }`);
     console.log(`  → GET  /agents`);
     console.log(`  → GET  /agents/:id`);
     console.log(`  → GET  /agents/:id/events`);
     console.log(`  → GET  /agents/:id/turns`);
-    console.log(`  → POST /agents/:id/tick      { operatorPrompt? }`);
+    console.log(`  → POST /agents/:id/schedule     { enabled, intervalSeconds }`);
+    console.log(`  → POST /agents/:id/tick         { operatorPrompt? }`);
   });
+
+  // Graceful shutdown so in-flight ticks finish before we die.
+  const shutdown = async (sig: string) => {
+    console.log(`[server] ${sig} received, shutting down…`);
+    server.close();
+    await scheduler.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT",  () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main();

@@ -56,6 +56,24 @@ export function App(): JSX.Element {
     finally { setBusy("none"); }
   };
 
+  const changeSchedule = async (enabled: boolean, intervalSeconds: number) => {
+    if (!selected) return;
+    setErr(null);
+    try {
+      await api.schedule(selected, enabled, intervalSeconds);
+      await refreshDetail();
+      await refreshList();
+    } catch (e) { setErr((e as Error).message); }
+  };
+
+  // Poll detail every 15s when auto-tick is enabled so the dashboard
+  // reflects the scheduler's activity without manual refresh.
+  useEffect(() => {
+    if (!detail?.record.autoTick?.enabled) return;
+    const t = setInterval(() => { refreshDetail(); }, 15000);
+    return () => clearInterval(t);
+  }, [detail?.record.autoTick?.enabled, refreshDetail]);
+
   return (
     <div className="shell">
       <h1>Kaizen</h1>
@@ -86,17 +104,32 @@ export function App(): JSX.Element {
         </div>
       </div>
 
-      {detail && <AgentPanel detail={detail} onTick={runTick} ticking={busy === "ticking"} tick={tick} />}
+      {detail && (
+        <AgentPanel
+          detail={detail}
+          onTick={runTick}
+          ticking={busy === "ticking"}
+          tick={tick}
+          onScheduleChange={changeSchedule}
+        />
+      )}
       {detail && <EventsPanel events={events} />}
     </div>
   );
 }
 
-function AgentPanel({ detail, onTick, ticking, tick }: {
+function AgentPanel({ detail, onTick, ticking, tick, onScheduleChange }: {
   detail: AgentDetail; onTick: () => void; ticking: boolean; tick: TickResult | null;
+  onScheduleChange: (enabled: boolean, intervalSeconds: number) => void;
 }): JSX.Element {
   const s = detail.snapshot;
   const b = detail.budget;
+  const autoTick = detail.record.autoTick;
+  const enabled = !!autoTick?.enabled;
+  const interval = autoTick?.intervalSeconds ?? 300;
+  const lastTick = autoTick?.lastTickTs
+    ? new Date(autoTick.lastTickTs).toISOString().slice(11, 19) + " UTC"
+    : "never";
   return (
     <>
       <div className="panel">
@@ -111,6 +144,29 @@ function AgentPanel({ detail, onTick, ticking, tick }: {
               {ticking ? "Ticking…" : "Run tick"}
             </button>
           </div>
+        </div>
+        <div className="row" style={{ marginTop: 12, gap: 12 }}>
+          <button
+            className={enabled ? "" : "ghost"}
+            onClick={() => onScheduleChange(!enabled, interval)}
+          >
+            {enabled ? "● Auto-tick ON" : "○ Auto-tick OFF"}
+          </button>
+          <label style={{ color: "var(--muted)", fontSize: 12 }}>
+            every&nbsp;
+            <select
+              value={interval}
+              onChange={(e) => onScheduleChange(enabled, Number(e.target.value))}
+              style={{ background: "var(--panel-alt)", color: "var(--text)", border: "1px solid var(--border)", padding: "4px 8px", borderRadius: 6, fontFamily: "var(--font-mono)", fontSize: 12 }}
+            >
+              <option value={60}>1 min</option>
+              <option value={300}>5 min</option>
+              <option value={900}>15 min</option>
+              <option value={1800}>30 min</option>
+              <option value={3600}>1 hour</option>
+            </select>
+            &nbsp;· last: {lastTick}
+          </label>
         </div>
       </div>
 
