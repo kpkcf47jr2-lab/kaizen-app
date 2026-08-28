@@ -38,6 +38,11 @@ import {
   makeMarkActedTool,
 } from "../src/tools/opportunity.js";
 import { makeReinvestPlanTool, makeReinvestApplyTool } from "../src/tools/reinvest.js";
+import {
+  makeDiscoverProductsTool,
+  makeAnalyzeProductTool,
+  makeCreateListingTool,
+} from "../src/tools/commerce.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -82,6 +87,9 @@ function makeApp() {
   tools.register(makeMarkActedTool());
   tools.register(makeReinvestPlanTool());
   tools.register(makeReinvestApplyTool());
+  tools.register(makeDiscoverProductsTool());
+  tools.register(makeAnalyzeProductTool());
+  tools.register(makeCreateListingTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
 
