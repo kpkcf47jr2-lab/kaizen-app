@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Typecheck + tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npx vitest run --reporter=verbose
+
+      - name: Frontend build
+        run: npx vite build --mode production
+
+      - name: Curator + eval script imports
+        # Import-only smoke check — real training runs on Lightning studio.
+        run: |
+          python3 -c "import ast; ast.parse(open('training/scripts/curate_dataset.py').read())"
+          python3 -c "import ast; ast.parse(open('training/scripts/eval_baseline.py').read())"
+          python3 -c "import ast; ast.parse(open('training/scripts/sft_qlora.py').read())"
+
+      - name: Verify no secrets in tracked files
+        run: |
+          # Basic scan — catches accidentally-committed private keys / mnemonics.
+          if git grep -nE 'LIGHTNING_API_KEY=|NVIDIA_API_KEY=|PRIVATE_KEY=|MNEMONIC=' -- \
+              ':!.github' ':!.env.example' ':!*.md'; then
+            echo "::error::Potential secret found in tracked files"; exit 1
+          fi
+          # Sanity — vault + data dirs must NOT be tracked
+          if git ls-files data/ 2>&1 | grep -q .; then
+            echo "::error::data/ has tracked files — vault leak risk"; exit 1
+          fi
