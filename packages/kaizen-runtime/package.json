@@ -1,0 +1,53 @@
+{
+  "name": "@kaizen/runtime",
+  "version": "0.1.0-alpha.0",
+  "description": "Kaizen Autonomous Runtime — continuous agent loop, heartbeat, self-mod, spawn, on-chain identity, autonomous payments.",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Kaizen LLC",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "import": "./dist/agent/index.js"
+    },
+    "./heartbeat": {
+      "types": "./dist/heartbeat/index.d.ts",
+      "import": "./dist/heartbeat/index.js"
+    },
+    "./self-mod": {
+      "types": "./dist/self-mod/index.d.ts",
+      "import": "./dist/self-mod/index.js"
+    },
+    "./spawn": {
+      "types": "./dist/spawn/index.d.ts",
+      "import": "./dist/spawn/index.js"
+    },
+    "./registry": {
+      "types": "./dist/registry/index.d.ts",
+      "import": "./dist/registry/index.js"
+    },
+    "./payments": {
+      "types": "./dist/payments/index.d.ts",
+      "import": "./dist/payments/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

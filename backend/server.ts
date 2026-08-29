@@ -23,7 +23,7 @@ import { DecisionLoop } from "../src/brain/decisionLoop.js";
 import { llmFromEnv } from "../src/brain/llm.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import { makeGetBalanceTool, makeTransferTool } from "../src/tools/wallet.js";
-import { makeQuoteTool } from "../src/tools/exchange.js";
+import { makeQuoteTool, makeSwapTool } from "../src/tools/exchange.js";
 import { makeCreateImageTool, makeCreateVideoTool } from "../src/tools/kame.js";
 import {
   makeOpenPositionTool,
@@ -53,10 +53,57 @@ import {
   makeTwitterPostTool,
   makeTelegramPostTool,
 } from "../src/tools/social.js";
+// Fase 7 gap #3: compute rental — Kaizen can now rent GPUs autonomously
+import { makeComputeListTool, makeComputeRentTool, makeComputeStopTool } from "../src/tools/compute.js";
+// Improvement.5: Kaizen decides when to retrain herself
+import { makeTrainingStatusTool, makeTrainingTriggerTool } from "../src/tools/training.js";
+// Path A: web browsing + landing pages + affiliate + ads
+import { makeWebSearchTool, makeWebFetchTool, makeWebScrapeTool } from "../src/tools/web.js";
+import { makeSitesDeployTool, makeAmazonLinkTool, makeMetaAdsTool } from "../src/tools/commerce_web.js";
+import { MockComputeProvider, type ComputeProvider } from "../src/compute/provider.js";
+import { RunpodProvider } from "../src/compute/runpod.js";
+import { LightningComputeProvider } from "../src/compute/lightning.js";
+import { NvidiaBrevProvider } from "../src/compute/nvidia-brev.js";
+import { MultiComputeProvider } from "../src/compute/multi.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
 import { AutoTickScheduler } from "./scheduler.js";
+import { appendEntry, count as waitlistCount, isValidEmail, loadEmails } from "./waitlist.js";
+// Fase 1 multi-turn ReAct runtime — new endpoint POST /agents/:id/run
+import { MultiTurnReactLoop } from "@kaizen/runtime/agent";
+import { toRuntimeSnapshot, wireLedger, wireLlm, wireTools } from "./runtime-wire.js";
+// Fase 4+5+7 spawn runtime
+import { RealSpawner, hashConstitutionBytes } from "@kaizen/runtime/spawn";
+import {
+  wireWalletProvisioner,
+  wireFundingBridge,
+  wireConstitutionSource,
+  wireChildRegistry,
+  makeReadParentState,
+} from "./spawner-wire.js";
+import fs from "node:fs";
+import path from "node:path";
+// Fase 2 heartbeat daemon (owner-controlled via HTTP)
+import {
+  RealHeartbeatDaemon,
+  ConsoleOwnerNotifier,
+  makeAutonomousTickTask,
+  makeCreditMonitorTask,
+  makeHealthCheckTask,
+} from "@kaizen/runtime/heartbeat";
+import { MultiTurnReactLoop as MTRLoop } from "@kaizen/runtime/agent";
+// Fase 5+7: on-chain self-registration for spawned children
+import { makeAutoRegister } from "./onchain-register.js";
+import { BASE } from "./wallet/service.js";
+// Improvement.1+.2: outcome measurement + curation
+import {
+  OutcomeMeasurer,
+  makePnlStrategy,
+  AutoCurator,
+} from "@kaizen/runtime";
+import { wireOutcomeLedger, wireMeasurementContext, wireCuratorLedger } from "./improvement-wire.js";
+import fsPromises from "node:fs/promises";
 
 const PORT = Number(process.env.KAIZEN_PORT || 4711);
 const HOST = process.env.KAIZEN_HOST || "127.0.0.1";
@@ -85,6 +132,7 @@ function makeApp() {
   tools.register(makeGetBalanceTool(walletService));
   tools.register(makeTransferTool(walletService));
   tools.register(makeQuoteTool());
+  tools.register(makeSwapTool(walletService));
   tools.register(makeCreateImageTool());
   tools.register(makeCreateVideoTool());
   tools.register(makeOpenPositionTool());
@@ -106,6 +154,28 @@ function makeApp() {
   tools.register(makeRoasTool());
   tools.register(makeTwitterPostTool());
   tools.register(makeTelegramPostTool());
+  // Compute provider — assemble whatever the env allows. If nothing is
+  // configured, fall back to Mock so `compute.list` still works locally.
+  const availableProviders: Record<string, ComputeProvider> = {};
+  if (process.env.RUNPOD_API_KEY)   availableProviders.runpod    = new RunpodProvider();
+  if (process.env.LIGHTNING_API_KEY) availableProviders.lightning = new LightningComputeProvider();
+  if (process.env.BREV_API_KEY)     availableProviders.nvidia    = new NvidiaBrevProvider();
+  const computeProvider = Object.keys(availableProviders).length === 0
+    ? new MockComputeProvider()
+    : new MultiComputeProvider({ providers: availableProviders });
+  tools.register(makeComputeListTool(computeProvider));
+  tools.register(makeComputeRentTool(computeProvider));
+  tools.register(makeComputeStopTool(computeProvider));
+  // Improvement.5: Kaizen inspects her own learning progress + can trigger retraining
+  tools.register(makeTrainingStatusTool());
+  tools.register(makeTrainingTriggerTool(computeProvider));
+  // Path A: web browsing + landing pages + affiliate + ads
+  tools.register(makeWebSearchTool());
+  tools.register(makeWebFetchTool());
+  tools.register(makeWebScrapeTool());
+  tools.register(makeSitesDeployTool());
+  tools.register(makeAmazonLinkTool());
+  tools.register(makeMetaAdsTool());
 
   const decisionLoop = new DecisionLoop(llmFromEnv(), tools, registry);
 
@@ -128,9 +198,66 @@ function makeApp() {
 
   const app = express();
   app.use(express.json({ limit: "256kb" }));
-  app.use(cors({ origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ }));
+  // Localhost for dev; kaizen-777.com + its www + any *.pages.dev preview
+  // so the landing (whether custom domain or CF preview URL) can POST here.
+  app.use(cors({
+    origin: [
+      /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/,
+      /^https?:\/\/(www\.)?kaizen-777\.com$/,
+      /^https:\/\/[a-z0-9-]+\.pages\.dev$/,
+    ],
+  }));
+
+  // Trust the proxy header when behind Cloudflare Tunnel so req.ip is real.
+  app.set("trust proxy", true);
 
   app.get("/healthz", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+  // ── Waitlist ─────────────────────────────────────────────────────
+  // Simple JSONL persistence. Idempotent: same email twice returns ok:true
+  // without duplicating the row. Rate-limited softly by-IP with a 3s
+  // in-memory window; anything more sophisticated waits until we actually
+  // see abuse, which we don't yet.
+  const waitlistWindow = new Map<string, number>();
+  app.post("/waitlist", (req, res) => {
+    try {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      const source = String(req.body?.source || "unknown").slice(0, 40);
+      if (!isValidEmail(email)) {
+        return res.status(400).json({ ok: false, error: "invalid email" });
+      }
+      const ip = String(req.ip || "").slice(0, 60);
+      const now = Date.now();
+      const last = waitlistWindow.get(ip);
+      if (last && now - last < 3000) {
+        return res.status(429).json({ ok: false, error: "too many requests" });
+      }
+      waitlistWindow.set(ip, now);
+
+      const existing = loadEmails();
+      if (existing.has(email)) {
+        return res.json({ ok: true, already: true });
+      }
+      appendEntry({
+        email,
+        source,
+        ts: now,
+        ip: ip || undefined,
+        ua: String(req.headers["user-agent"] || "").slice(0, 200) || undefined,
+      });
+      return res.json({ ok: true });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: (e as Error).message });
+    }
+  });
+
+  app.get("/waitlist/count", (_req, res) => {
+    try {
+      res.json({ count: waitlistCount() });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
 
   // Root handler — useful when someone opens the base URL in a browser and
   // otherwise gets Express's default "Cannot GET /" 404.
@@ -147,7 +274,16 @@ function makeApp() {
       "GET  /agents/:id/events":    "recent economic events",
       "GET  /agents/:id/turns":     "recent conversation turns",
       "POST /agents/:id/schedule":  "toggle auto-tick { enabled, intervalSeconds }",
-      "POST /agents/:id/tick":      "run one Decision Loop tick (LLM ~30-60s)",
+      "POST /agents/:id/tick":      "run one Decision Loop tick (LLM ~30-60s, 1 tool per call)",
+      "POST /agents/:id/run":       "run Fase 1 multi-turn ReAct loop (Think→Act→Observe until done, capped)",
+      "POST /agents/:id/spawn":     "Fase 4/7: spawn a child agent with real Kairos wallet + USDC seed",
+      "GET  /agents/:id/children":  "list spawned children of this agent",
+      "POST /agents/:id/heartbeat/start":  "Fase 2/7: start autonomous heartbeat daemon (Kaizen ticks on its own)",
+      "POST /agents/:id/heartbeat/stop":   "stop the heartbeat daemon",
+      "GET  /agents/:id/heartbeat/status": "daemon state + task registry",
+      "POST /agents/:id/register-onchain": "Fase 5/7: child registers itself in KairosAgentRegistry on Base",
+      "POST /waitlist":             "landing waitlist signup { email, source? }",
+      "GET  /waitlist/count":       "public count of waitlist entries",
     },
     tools: {
       wallet: ["getBalance", "transfer"],
@@ -160,7 +296,16 @@ function makeApp() {
       commerce: ["discoverProducts", "analyzeProduct", "createListing"],
       marketing: ["createCampaign", "recordSpend", "recordRevenue", "roas"],
       social: ["twitter.postTweet", "telegram.postMessage"],
+      compute: ["list", "rentGpu", "stopGpu"],
+      training: ["status", "trigger"],
+      web: ["search", "fetch", "scrape"],
+      sites: ["deployLanding"],
+      affiliate: ["amazon.link"],
+      ads: ["meta.createDraft"],
     },
+    computeProvider: Object.keys(availableProviders).length === 0
+      ? "mock"
+      : `multi:${Object.keys(availableProviders).join("+")}`,
     ts: Date.now(),
   }));
 
@@ -246,6 +391,292 @@ function makeApp() {
       });
       const updated = await registry.get(req.params.id);
       res.json({ record: updated });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // ── Heartbeat daemons (one per agent, in-memory) ─────────────────
+  // Fase 7 gap #1 fix: expose the Fase 2 daemon over HTTP so the owner
+  // can start / stop autonomous ticks without opening a REPL.
+  const daemons = new Map<string, RealHeartbeatDaemon>();
+
+  function ensureDaemon(agentId: string): RealHeartbeatDaemon {
+    const existing = daemons.get(agentId);
+    if (existing) return existing;
+    const notifier = new ConsoleOwnerNotifier(agentId);
+    const daemon = new RealHeartbeatDaemon(
+      { agentId, runtimeVersion: "0.1.0-alpha.0", readOnly: false, killSwitchEnv: "KAIZEN_KILL" },
+      {
+        snapshotProvider: async () => {
+          const record = await registry.get(agentId);
+          if (!record) throw new Error(`agent ${agentId} not found`);
+          const balances = await walletService.readBalances(agentId);
+          let gasUsdTotal = 0;
+          for (const [idStr, per] of Object.entries(balances.byChain)) {
+            gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+          }
+          const snap = snapshot(agentId,
+            { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+            [], { outflow24hUsd: 0, outflow7dUsd: 0 }, record.peakNetWorthUsd);
+          const children = (await registry.list()).filter((r) => r.parentAgentId === agentId);
+          return toRuntimeSnapshot(agentId, snap, children.length);
+        },
+        notifier,
+      },
+    );
+    // Built-in tasks: health check + credit monitor + autonomous tick
+    daemon.register(makeHealthCheckTask({
+      notifier,
+      async ping() {
+        // Ping our own /healthz endpoint via localhost
+        const t0 = Date.now();
+        try {
+          const r = await fetch(`http://127.0.0.1:${PORT}/healthz`);
+          return { ok: r.ok, latencyMs: Date.now() - t0 };
+        } catch (e) {
+          return { ok: false, latencyMs: -1, note: (e as Error).message };
+        }
+      },
+    }));
+    daemon.register(makeCreditMonitorTask({ minReserveUsd: 2, notifier }));
+    // Autonomous tick uses the multi-turn ReAct loop
+    const loop = new MTRLoop(
+      { agentId, runtimeVersion: "0.1.0-alpha.0", readOnly: false, killSwitchEnv: "KAIZEN_KILL" },
+      { llm: wireLlm(llmFromEnv()),
+        tools: wireTools(tools, (id) => ({ agentId: id, ts: Date.now() })),
+        ledger: wireLedger() },
+    );
+    daemon.register(makeAutonomousTickTask({
+      loop,
+      operatorPrompt: "Continue autonomous operation. Observe state, pick one high-value action, execute.",
+      runOptions: { maxSteps: 4, maxWallMs: 90_000, maxCostUsd: 0.02 },
+    }));
+    // Improvement.1: measure outcomes on due decisions (PnL 1h/24h/7d).
+    // Runs at least every 5 min; the OutcomeMeasurer itself drains what
+    // is `due_at <= now`, so scheduling early is safe.
+    const measurer = new OutcomeMeasurer(
+      wireOutcomeLedger(agentId),
+      wireMeasurementContext(agentId, walletService),
+    );
+    for (const kind of ["pnl_1h", "pnl_24h", "pnl_7d"] as const) {
+      measurer.register(makePnlStrategy(kind));
+    }
+    daemon.register({
+      name: "improvement:measure-outcomes",
+      minIntervalMs: 5 * 60_000,
+      async run(ctx) {
+        const r = await measurer.tick(50);
+        if (r.failed > 0) {
+          await notifier.notify("banner", "outcome measurements failing",
+            `${r.failed} failed / ${r.processed} ok`,
+            { agentId: ctx.agentId, category: "improvement" });
+        }
+      },
+    });
+    // Improvement.2: curate SFT + DPO datasets every 6h. Writes JSONL
+    // files to data/datasets/ ready for the next training round.
+    daemon.register({
+      name: "improvement:curate-dataset",
+      minIntervalMs: 6 * 3600_000,
+      async run(ctx) {
+        const curator = new AutoCurator({ ledger: wireCuratorLedger(agentId) });
+        const [sft, dpo, evalSet] = await Promise.all([
+          curator.buildSft(),
+          curator.buildDpo(),
+          curator.buildEval(0.1),
+        ]);
+        const outDir = path.resolve(process.env.KAIZEN_STATE_DIR ?? "./data", "datasets", agentId);
+        await fsPromises.mkdir(outDir, { recursive: true });
+        const stamp = new Date().toISOString().slice(0, 10);
+        await Promise.all([
+          fsPromises.writeFile(path.join(outDir, `sft-${stamp}.jsonl`), sft.map((e) => JSON.stringify(e)).join("\n")),
+          fsPromises.writeFile(path.join(outDir, `dpo-${stamp}.jsonl`), dpo.map((p) => JSON.stringify(p)).join("\n")),
+          fsPromises.writeFile(path.join(outDir, `eval-${stamp}.jsonl`), evalSet.map((e) => JSON.stringify(e)).join("\n")),
+        ]);
+        if (sft.length + dpo.length > 0) {
+          await notifier.notify("silent", "dataset curated",
+            `${sft.length} SFT + ${dpo.length} DPO pairs ready under ${outDir}`,
+            { agentId: ctx.agentId, category: "improvement" });
+        }
+      },
+    });
+    daemons.set(agentId, daemon);
+    return daemon;
+  }
+
+  app.post("/agents/:id/heartbeat/start", async (req, res) => {
+    try {
+      const record = await registry.get(req.params.id);
+      if (!record) return res.status(404).json({ error: "not found" });
+      const daemon = ensureDaemon(req.params.id);
+      await daemon.start();
+      res.json({ ok: true, status: daemon.status() });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  app.post("/agents/:id/heartbeat/stop", async (req, res) => {
+    const daemon = daemons.get(req.params.id);
+    if (!daemon) return res.json({ ok: true, note: "no daemon was running" });
+    await daemon.stop();
+    res.json({ ok: true, status: daemon.status() });
+  });
+
+  app.get("/agents/:id/heartbeat/status", (req, res) => {
+    const daemon = daemons.get(req.params.id);
+    if (!daemon) return res.json({ running: false, note: "no daemon initialized" });
+    res.json(daemon.status());
+  });
+
+  // ── /agents/:id/spawn — Fase 4/5/7 spawn a child agent ────────
+  // Creates a new Kaizen agent under `:id` as its parent, funds it with
+  // `seedUsdc` on `chainId`, and (by default) registers on-chain in the
+  // KairosAgentRegistry so its parent can rediscover it after a restart.
+  //
+  // Body:
+  //   { seedUsdc: number, chainId?: 137|8453, goal: string,
+  //     strategyLabels: string[], registerOnChain?: boolean }
+  app.post("/agents/:id/spawn", async (req, res) => {
+    try {
+      const parentAgentId = req.params.id;
+      const parentRec = await registry.get(parentAgentId);
+      if (!parentRec) return res.status(404).json({ error: "parent not found" });
+
+      const body = req.body ?? {};
+      const seedUsdc = Number(body.seedUsdc ?? 0);
+      const chainId = (Number(body.chainId ?? 8453) as 137 | 8453);
+      const goal = String(body.goal ?? "").slice(0, 4_000);
+      const strategyLabels = Array.isArray(body.strategyLabels) ? body.strategyLabels.map(String) : [];
+      if (seedUsdc <= 0 || !Number.isFinite(seedUsdc)) {
+        return res.status(400).json({ error: "seedUsdc must be a positive number" });
+      }
+      if (!goal) return res.status(400).json({ error: "goal required" });
+
+      // Wire the spawner against real kaizen-app primitives.
+      const passphrase = requirePassphrase();
+      const spawner = new RealSpawner({
+        wallets: wireWalletProvisioner(vault, registry, passphrase),
+        funding: wireFundingBridge(walletService),
+        constitution: wireConstitutionSource(),
+        registry: wireChildRegistry(registry),
+        readParentState: makeReadParentState(registry, walletService, stateLoader,
+          { minNetWorthToSpawnUsd: 5, maxChildAgents: 3 }),
+        chainId,
+      });
+
+      // Hash the constitution bytes so RealSpawner can verify no drift.
+      const constPath = path.resolve(process.cwd(),
+        "packages", "kaizen-runtime", "CONSTITUTION.md");
+      const constitutionSha256 = hashConstitutionBytes(fs.readFileSync(constPath, "utf8"));
+
+      const child = await spawner.spawn({
+        goal,
+        strategyLabels,
+        budgetUsd: seedUsdc,
+        constitutionSha256,
+        parentAgentId,
+        parentAddress: parentRec.address,
+      });
+
+      res.json({
+        child,
+        constitutionSha256,
+        // Full on-chain registration is a Fase 7 backlog: the parent needs
+        // its own USDC to swap into the child's ETH gas so the child can
+        // register itself. Report `registered=false` for now.
+        registered: false,
+        note: "Child created + funded off-chain. On-chain registration deferred to child's first heartbeat.",
+      });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // ── /agents/:id/register-onchain — Fase 5 self-registration ────
+  // Any child agent can register itself in the KairosAgentRegistry
+  // contract on Base. Uses the child's OWN wallet (its own gas). Owner
+  // triggers this manually the first time; a Fase 7 heartbeat task can
+  // automate it once the child has ETH.
+  app.post("/agents/:id/register-onchain", async (req, res) => {
+    try {
+      const chainId = (Number(req.body?.chainId ?? 8453) as 137 | 8453);
+      const rpcUrl = chainId === 8453
+        ? (process.env.BASE_RPC_URL || BASE.rpcUrl)
+        : "https://polygon-rpc.com";
+      const autoReg = makeAutoRegister(vault, registry, requirePassphrase());
+      const result = await autoReg({
+        childAgentId: req.params.id, chainId, rpcUrl,
+        agentCardUri: req.body?.agentCardUri,
+      });
+      if (!result.ok) return res.status(400).json(result);
+      res.json({
+        ...result,
+        explorerUrl: chainId === 8453 && result.txHash
+          ? `https://basescan.org/tx/${result.txHash}` : undefined,
+      });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // ── /agents/:id/children — list spawned children ───────────────
+  app.get("/agents/:id/children", async (req, res) => {
+    try {
+      const all = await registry.list();
+      const children = all.filter((r) => r.parentAgentId === req.params.id);
+      res.json({ parent: req.params.id, count: children.length, children });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // ── /agents/:id/run — Fase 1 multi-turn ReAct loop ─────────────
+  // The autonomous entry point. Runs Think → Act → Observe → repeat until
+  // the LLM emits an assistant-only message (done), any cap is hit
+  // (steps, wall time, cost), the loop detector aborts, or the kill
+  // switch flips. Persists every turn + every abort into the Economic
+  // Ledger via wireLedger().
+  app.post("/agents/:id/run", async (req, res) => {
+    try {
+      const record = await registry.get(req.params.id);
+      if (!record) return res.status(404).json({ error: "not found" });
+      const balances = await walletService.readBalances(req.params.id);
+      let gasUsdTotal = 0;
+      for (const [idStr, per] of Object.entries(balances.byChain)) {
+        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+      }
+      const snap = snapshot(
+        req.params.id,
+        { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+        [],
+        { outflow24hUsd: 0, outflow7dUsd: 0 },
+        record.peakNetWorthUsd,
+      );
+      const runtimeSnap = toRuntimeSnapshot(req.params.id, snap);
+
+      const loop = new MultiTurnReactLoop(
+        {
+          agentId: req.params.id,
+          runtimeVersion: "0.1.0-alpha.0",
+          readOnly: false,
+          killSwitchEnv: "KAIZEN_KILL",
+        },
+        {
+          llm: wireLlm(llmFromEnv()),
+          tools: wireTools(tools, (agentId) => ({ agentId, ts: Date.now() })),
+          ledger: wireLedger(),
+        },
+      );
+
+      const result = await loop.run(runtimeSnap, {
+        operatorPrompt: req.body?.operatorPrompt,
+        maxSteps: Number(req.body?.maxSteps ?? 10),
+        maxWallMs: Number(req.body?.maxWallMs ?? 5 * 60 * 1000),
+        maxCostUsd: Number(req.body?.maxCostUsd ?? 0.50),
+      });
+      res.json({ snapshot: snap, budget: proposeBudget(snap.netWorthUsd, snap.suggestedStatus), result });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }

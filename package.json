@@ -20,10 +20,12 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@kaizen/runtime": "*",
     "@kaizen/wallet-core": "*",
     "@scure/bip32": "^1.7.0",
     "@scure/bip39": "^1.4.0",
     "better-sqlite3": "^11.3.0",
+    "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "ethers": "^6.13.4",
     "express": "^4.21.1",

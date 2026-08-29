@@ -15,13 +15,18 @@
 
 import {
   deriveEvmAccount,
+  erc20Allowance,
   erc20Balance,
   nativeBalance,
   open as openVault,
+  signAndSendErc20Approve,
   signAndSendErc20Transfer,
+  signAndSendNativeTransfer,
+  signAndSendUniv2Swap,
   type ChainConfig,
   type VaultBlob,
 } from "@kaizen/wallet-core";
+import { parseUnits } from "ethers";
 import { PolicyEngine } from "../../src/policy/engine.js";
 import type { AgentState } from "../../src/policy/engine.js";
 import { PermissionLevel } from "../../src/policy/limits.js";
@@ -99,6 +104,40 @@ export interface TransferResult {
 }
 
 export interface TransferRejected {
+  ok: false;
+  reason: string;
+  auditLevel: "debug" | "info" | "warn" | "critical";
+}
+
+// ── Swap request coming from the agent ───────────────────────────────
+export interface SwapRequest {
+  agentId: string;
+  chainId: number;
+  buyToken: string;              // ERC-20 to receive
+  buyTokenDecimals: number;
+  amountUsdc: number;            // human units — USDC to sell
+  strategy: string;              // strategy label for the ledger
+  reason: string;                // short thesis
+  slippageBps?: number;          // default 50 = 0.5%
+}
+
+export interface SwapResult {
+  ok: true;
+  chain: string;
+  strategy: string;
+  amountUsdcIn: number;
+  buyToken: string;
+  buyAmountRaw: string;          // raw wei from receipt (parsed from logs later)
+  minBuyAmountRaw: string;
+  bestDex: string;
+  routerAddress: string;
+  approveTxHash?: string;        // only if approval was needed
+  swapTxHash: string;
+  quoteFeeUsd: number;
+  gasSpentEth?: string;
+}
+
+export interface SwapRejected {
   ok: false;
   reason: string;
   auditLevel: "debug" | "info" | "warn" | "critical";
@@ -231,6 +270,181 @@ export class SecureWalletService {
       txHash: tx.hash,
       chain: chain.name,
       amountUsdc: req.amountUsdc,
+    };
+  }
+
+  /** Sign + broadcast a native (ETH / POL) transfer. Same policy gate as
+   *  ERC-20: PolicyEngine.evaluate is run with `tool="wallet.transferNative"`
+   *  before the vault is opened. Intended for gas-seeding child agents
+   *  during spawn (small amounts) — the destinationRole must be
+   *  `agent-owned` and the amount respected by MAX_TX_USD when converted
+   *  at the injected native/USD rate. */
+  async transferNative(req: {
+    agentId: string;
+    to: string;
+    destinationRole: string;
+    amountEth: number;
+    chainId: 137 | 8453;
+    nativeUsdRate: number;      // e.g. 3200 for ETH, 0.5 for POL
+    reason: string;
+  }): Promise<TransferResult | TransferRejected> {
+    const chain = CHAINS[req.chainId];
+    if (!chain) return { ok: false, reason: `Chain ${req.chainId} not registered`, auditLevel: "critical" };
+
+    const state = await this.stateLoader.load(req.agentId);
+    const valueUsd = req.amountEth * req.nativeUsdRate;
+    const decision = this.policy.evaluate(state, {
+      tool: "wallet.transfer",
+      level: PermissionLevel.FINANCIAL,
+      valueUsd,
+      destinationRole: req.destinationRole,
+      chainId: req.chainId,
+    });
+    if (!decision.allow) return { ok: false, reason: decision.reason, auditLevel: decision.auditLevel };
+
+    const blob = await this.vaultStore.load(req.agentId);
+    if (!blob) throw new Error(`No vault for agent ${req.agentId}`);
+    const mnemonic = await openVault(blob, this.passphrase);
+    const account = deriveEvmAccount(mnemonic);
+
+    const tx = await signAndSendNativeTransfer({
+      chain, privateKey: account.privateKey, to: req.to, amountEth: req.amountEth,
+    });
+    await this.stateLoader.recordOutflow(req.agentId, valueUsd);
+    await this.stateLoader.recordTxHash(req.agentId, tx.hash, valueUsd);
+    return { ok: true, txHash: tx.hash, chain: chain.name, amountUsdc: valueUsd };
+  }
+
+  /** Execute a DEX swap: USDC -> buyToken via the Kairos Router's chosen
+   *  UniswapV2-compatible venue. Full flow:
+   *    1. Fetch a fresh quote from the router (bestRouter + path + minOut)
+   *    2. Policy Engine check (as exchange.swap intent with valueUsd = amountUsdc)
+   *    3. Approve router for USDC if allowance < amount
+   *    4. Call swapExactTokensForTokens
+   *    5. Register outflow + tx in the Economic Ledger loader
+   *  Never exposes the private key beyond openVault → local Wallet instance. */
+  async swapExactUsdcFor(req: SwapRequest): Promise<SwapResult | SwapRejected> {
+    const chain = CHAINS[req.chainId];
+    const usdcConfig = USDC_BY_CHAIN[req.chainId];
+    if (!chain || !usdcConfig) {
+      return {
+        ok: false,
+        reason: `Chain ${req.chainId} not registered in Secure Wallet Service`,
+        auditLevel: "critical",
+      };
+    }
+
+    // ── 1) Fresh quote from router ──────────────────────────────────
+    const sellAmountRaw = parseUnits(req.amountUsdc.toString(), usdcConfig.decimals);
+    const ROUTER_BASE = process.env.KAIROS_ROUTER_BASE || "https://api.kairos777.com/api/router";
+    const quoteUrl =
+      `${ROUTER_BASE}/quote?chainId=${req.chainId}` +
+      `&sellToken=${usdcConfig.address}` +
+      `&buyToken=${req.buyToken}` +
+      `&sellAmount=${sellAmountRaw.toString()}`;
+    const qres = await fetch(quoteUrl);
+    const qbody = (await qres.json().catch(() => ({}))) as {
+      success?: boolean;
+      error?: string;
+      data?: {
+        buyAmount?: string;
+        bestBuyAmount?: string;
+        minBuyAmount?: string;
+        bestDex?: string;
+        bestRouter?: string;
+        path?: string[];
+        feeUsd?: number;
+      };
+    };
+    if (!qres.ok || !qbody.success || !qbody.data?.bestRouter) {
+      return {
+        ok: false,
+        reason: `Router quote failed: ${qbody.error || `HTTP ${qres.status}`}`,
+        auditLevel: "warn",
+      };
+    }
+    const routerAddress = qbody.data.bestRouter;
+    const path = qbody.data.path || [usdcConfig.address, req.buyToken];
+    const bestDex = qbody.data.bestDex || "unknown";
+    const buyAmountRaw = BigInt(qbody.data.bestBuyAmount || qbody.data.buyAmount || "0");
+    // Apply owner slippage on top of the router's minBuyAmount (defensive).
+    const routerMinRaw = BigInt(qbody.data.minBuyAmount || buyAmountRaw.toString());
+    const slippageBps = BigInt(req.slippageBps ?? 50);
+    const ourMinRaw = (buyAmountRaw * (10000n - slippageBps)) / 10000n;
+    const minBuyAmountRaw = ourMinRaw < routerMinRaw ? ourMinRaw : routerMinRaw;
+
+    // ── 2) Policy check ────────────────────────────────────────────
+    const state = await this.stateLoader.load(req.agentId);
+    const decision = this.policy.evaluate(state, {
+      tool: "exchange.swap",
+      level: PermissionLevel.FINANCIAL,
+      valueUsd: req.amountUsdc,
+      chainId: req.chainId,
+      // NB: swaps are NOT outflow (money changes token but stays in-wallet),
+      // so no destinationRole check; PolicyEngine skips whitelist for swaps.
+      metadata: { strategyExposureUsd: req.amountUsdc },
+    });
+    if (!decision.allow) {
+      return { ok: false, reason: decision.reason, auditLevel: decision.auditLevel };
+    }
+
+    // ── 3) Open vault (single time), derive account ────────────────
+    const blob = await this.vaultStore.load(req.agentId);
+    if (!blob) throw new Error(`No vault for agent ${req.agentId}`);
+    const mnemonic = await openVault(blob, this.passphrase);
+    const account = deriveEvmAccount(mnemonic);
+
+    // ── 4) Ensure allowance ────────────────────────────────────────
+    let approveTxHash: string | undefined;
+    const currentAllow = await erc20Allowance(chain, usdcConfig.address, account.address, routerAddress);
+    if (currentAllow < sellAmountRaw) {
+      const approveTx = await signAndSendErc20Approve({
+        chain,
+        privateKey: account.privateKey,
+        tokenAddress: usdcConfig.address,
+        spender: routerAddress,
+        amountRaw: sellAmountRaw,        // exact-amount approval, not unlimited
+      });
+      approveTxHash = approveTx.hash;
+      await approveTx.wait();            // block until confirmed
+    }
+
+    // ── 5) Swap ────────────────────────────────────────────────────
+    const deadline = Math.floor(Date.now() / 1000) + 600;   // +10 min
+    const swapTx = await signAndSendUniv2Swap({
+      chain,
+      privateKey: account.privateKey,
+      routerAddress,
+      amountInRaw: sellAmountRaw,
+      amountOutMinRaw: minBuyAmountRaw,
+      path,
+      to: account.address,
+      deadline,
+    });
+    const receipt = await swapTx.wait();
+    const gasSpentWei = receipt ? (receipt.gasUsed * (receipt.gasPrice ?? 0n)) : 0n;
+    const gasSpentEth = (Number(gasSpentWei) / 1e18).toFixed(8);
+
+    // ── 6) Record ledger side-effects ──────────────────────────────
+    // Swaps stay in-wallet (USDC → token), so outflow doesn't grow. Record
+    // the tx hash for audit; the caller (tool wrapper) also writes an
+    // economic_event with the strategy label.
+    await this.stateLoader.recordTxHash(req.agentId, swapTx.hash, req.amountUsdc);
+
+    return {
+      ok: true,
+      chain: chain.name,
+      strategy: req.strategy,
+      amountUsdcIn: req.amountUsdc,
+      buyToken: req.buyToken,
+      buyAmountRaw: buyAmountRaw.toString(),
+      minBuyAmountRaw: minBuyAmountRaw.toString(),
+      bestDex,
+      routerAddress,
+      approveTxHash,
+      swapTxHash: swapTx.hash,
+      quoteFeeUsd: qbody.data.feeUsd || 0,
+      gasSpentEth,
     };
   }
 }

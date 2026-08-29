@@ -55,6 +55,24 @@ export class ComposedStateLoader implements AgentStateLoader {
     // Sum USDC + native across every whitelisted chain. This is a repeat of
     // SecureWalletService.readBalances(), duplicated here to avoid a circular
     // dep (service depends on stateLoader). Keep the two in sync.
+    //
+    // 2026-08-29: retry twice with 500ms backoff before falling back to 0 —
+    // a single transient RPC failure was mis-reporting cash=0 which the
+    // PolicyEngine then interpreted as HIBERNATING drawdown. Two retries
+    // handle the common `429 Too Many Requests` / `503` blips without
+    // adding a hard failure mode when the RPC is genuinely down.
+    const withRetry = async <T>(fn: () => Promise<T>, fallback: T, label: string): Promise<T> => {
+      let lastErr: Error | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { return await fn(); } catch (e) {
+          lastErr = e as Error;
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
+      console.warn(`[stateLoader] ${label} failed 3x, using fallback. Last err: ${lastErr?.message ?? "(none)"}`);
+      return fallback;
+    };
+
     const chainIds = Object.keys(CHAINS).map(Number);
     const perChain = await Promise.all(
       chainIds.map(async (id) => {
@@ -62,8 +80,8 @@ export class ComposedStateLoader implements AgentStateLoader {
         const usdc = USDC_BY_CHAIN[id];
         if (!chain || !usdc) return { id, usdc: 0, native: 0 };
         const [u, n] = await Promise.all([
-          erc20Balance(chain, usdc.address, record.address).catch(() => ({ formatted: 0 })),
-          nativeBalance(chain, record.address).catch(() => 0),
+          withRetry(() => erc20Balance(chain, usdc.address, record.address), { formatted: 0 } as { formatted: number }, `erc20Balance(${chain.name})`),
+          withRetry(() => nativeBalance(chain, record.address), 0 as number, `nativeBalance(${chain.name})`),
         ]);
         return { id, usdc: u.formatted, native: n };
       }),

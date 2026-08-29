@@ -17,6 +17,7 @@ training/adapters/**/*.safetensors
 training/adapters/**/*.bin
 training/adapters/**/wandb/
 training/adapters/**/checkpoints/
+training/adapters/**/tokenizer.json
 
 # Ephemeral
 *.log

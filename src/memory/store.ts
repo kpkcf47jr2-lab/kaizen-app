@@ -37,6 +37,7 @@ export interface EconomicEvent {
     | "capital_allocation"
     | "trade_open"
     | "trade_close"
+    | "trade_swap"
     | "transfer_out"
     | "transfer_in"
     | "campaign_spend"
@@ -160,10 +161,41 @@ export class MemoryStore {
     for (const alter of [
       "ALTER TABLE positions ADD COLUMN buy_token_decimals INTEGER",
       "ALTER TABLE positions ADD COLUMN entry_price_usd REAL",
+      // Improvement.1 (2026-08-29): outcome tracking on economic_events.
+      // Every event that is a "decision worth learning from" gets its
+      // outcome measured N hours later by the improvement:measure-outcomes
+      // heartbeat task. Populates these columns so the auto-curator
+      // (Improvement.2) can filter datasets by realized ROI.
+      "ALTER TABLE economic_events ADD COLUMN outcome_measured_at INTEGER",
+      "ALTER TABLE economic_events ADD COLUMN outcome_usd REAL",
+      "ALTER TABLE economic_events ADD COLUMN outcome_metric TEXT",
+      "ALTER TABLE economic_events ADD COLUMN outcome_success INTEGER",
     ]) {
       try { this.db.exec(alter); }
       catch (e) { if (!/duplicate column/i.test(String(e))) throw e; }
     }
+
+    // Outcome measurement queue — tasks scheduled to run at `due_at` that
+    // read the current world state and write back the measurement to the
+    // triggering event. Keeps the schedule persistent across restarts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS outcome_measurements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL REFERENCES economic_events(id) ON DELETE CASCADE,
+        due_at INTEGER NOT NULL,           -- when to run
+        kind TEXT NOT NULL,                -- 'pnl' | 'roas' | 'conversion' | ...
+        params TEXT,                       -- JSON: strategy-specific measurement config
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done','failed')),
+        result_usd REAL,
+        result_success INTEGER,
+        completed_at INTEGER,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_outmeas_due
+        ON outcome_measurements(due_at) WHERE status='pending';
+      CREATE INDEX IF NOT EXISTS idx_outmeas_event
+        ON outcome_measurements(event_id);
+    `);
 
     this.db.exec(`
       -- Marker for later — keeps migrate() re-callable without side effects.
@@ -249,6 +281,101 @@ export class MemoryStore {
       )
       .get(cutoff) as { s: number };
     return row.s;
+  }
+
+  // ── outcome measurements (Improvement.1) ─────────────────────────
+  // Every "decision" event (trade_open, campaign_spend, capital_allocation
+  // to a strategy) schedules one or more measurements at future times.
+  // The improvement:measure-outcomes heartbeat task drains this queue
+  // and writes the resulting `outcome_usd / outcome_success` back to
+  // the source event so the auto-curator (Improvement.2) can filter
+  // datasets by realized win/loss.
+
+  scheduleMeasurement(m: {
+    eventId: number;
+    dueAt: number;
+    kind: string;
+    params?: Record<string, unknown>;
+  }): number {
+    const info = this.db
+      .prepare(
+        "INSERT INTO outcome_measurements (event_id, due_at, kind, params) VALUES (?,?,?,?)",
+      )
+      .run(m.eventId, m.dueAt, m.kind, m.params ? JSON.stringify(m.params) : null);
+    return Number(info.lastInsertRowid);
+  }
+
+  duePendingMeasurements(limit = 50): Array<{
+    id: number; eventId: number; dueAt: number; kind: string; params: Record<string, unknown> | null;
+  }> {
+    const rows = this.db
+      .prepare(
+        "SELECT id, event_id AS eventId, due_at AS dueAt, kind, params " +
+        "FROM outcome_measurements WHERE status='pending' AND due_at <= ? " +
+        "ORDER BY due_at ASC LIMIT ?",
+      )
+      .all(Date.now(), limit) as Array<{ id: number; eventId: number; dueAt: number; kind: string; params: string | null }>;
+    return rows.map((r) => ({
+      ...r,
+      params: r.params ? JSON.parse(r.params) as Record<string, unknown> : null,
+    }));
+  }
+
+  completeMeasurement(id: number, result: {
+    resultUsd: number | null;
+    resultSuccess: boolean | null;
+    error?: string;
+  }): void {
+    const status = result.error ? "failed" : "done";
+    this.db
+      .prepare(
+        "UPDATE outcome_measurements SET status=?, result_usd=?, result_success=?, completed_at=?, error=? WHERE id=?",
+      )
+      .run(status, result.resultUsd, result.resultSuccess === null ? null : (result.resultSuccess ? 1 : 0), Date.now(), result.error ?? null, id);
+  }
+
+  /** Enrich an event with its measured outcome so training data can
+   *  filter by realized ROI. Idempotent per (eventId, kind). */
+  recordOutcome(eventId: number, outcome: {
+    outcomeUsd: number;
+    metric: string;
+    success: boolean;
+  }): void {
+    this.db
+      .prepare(
+        "UPDATE economic_events SET outcome_measured_at=?, outcome_usd=?, outcome_metric=?, outcome_success=? WHERE id=?",
+      )
+      .run(Date.now(), outcome.outcomeUsd, outcome.metric, outcome.success ? 1 : 0, eventId);
+  }
+
+  /** For the Improvement.2 auto-curator: fetch events that HAVE a
+   *  measured outcome, filtered by success. Includes conversation
+   *  context via a LEFT JOIN so training examples come with the
+   *  decision prompt + reasoning. */
+  eventsWithOutcome(opts?: {
+    sinceMs?: number;
+    successOnly?: boolean;
+    kinds?: string[];
+    limit?: number;
+  }): Array<EconomicEvent & { outcomeUsd: number; outcomeMetric: string; outcomeSuccess: boolean }> {
+    const sinceMs = opts?.sinceMs ?? 30 * 24 * 3600_000;
+    const cutoff = Date.now() - sinceMs;
+    const successFilter = opts?.successOnly ? " AND outcome_success = 1" : "";
+    const kindFilter = opts?.kinds && opts.kinds.length > 0
+      ? " AND kind IN (" + opts.kinds.map(() => "?").join(",") + ")"
+      : "";
+    const limit = opts?.limit ?? 500;
+    const sql =
+      "SELECT id, ts, kind, strategy, amount_usd AS amountUsd, tx_hash AS txHash, " +
+      "reason, confidence, outcome, metadata, " +
+      "outcome_usd AS outcomeUsd, outcome_metric AS outcomeMetric, outcome_success AS outcomeSuccess " +
+      "FROM economic_events " +
+      "WHERE ts >= ? AND outcome_measured_at IS NOT NULL" +
+      successFilter + kindFilter +
+      " ORDER BY ts DESC LIMIT ?";
+    const params = [cutoff, ...(opts?.kinds ?? []), limit];
+    const rows = this.db.prepare(sql).all(...params) as Array<EconomicEvent & { outcomeUsd: number; outcomeMetric: string; outcomeSuccess: number }>;
+    return rows.map((r) => ({ ...r, outcomeSuccess: r.outcomeSuccess === 1 }));
   }
 
   // ── facts (long-term key/value memory) ────────────────────────────
