@@ -29,4 +29,6 @@ export * from "./skills/index.js";
 export * from "./identity/soul.js";
 // Improvement.1 outcome tracking (Kaizen loop)
 export * from "./improvement/index.js";
+export * from "./improvement/versioning.js";
+export * from "./improvement/shadow.js";
 export * from "./types.js";
