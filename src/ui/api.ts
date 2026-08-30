@@ -94,7 +94,12 @@ export interface TickResult {
   usage?: { prompt: number; completion: number; total: number };
 }
 
-const BASE = "/api";
+// In dev, Vite proxies /api → localhost:4711. In production, set
+// VITE_API_BASE to the backend URL (e.g. a Cloudflare Tunnel or a named
+// api subdomain). When VITE_API_BASE is set, requests hit "<base><path>"
+// directly, bypassing the /api prefix.
+const BASE = (import.meta as { env?: Record<string, string | undefined> })
+  .env?.VITE_API_BASE || "/api";
 
 async function jget<T>(path: string): Promise<T> {
   const r = await fetch(`${BASE}${path}`);

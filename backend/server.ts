@@ -706,6 +706,70 @@ function makeApp() {
     }
   });
 
+  // Kairos-wallet compat endpoint. The wallet's KairosAgent component POSTs
+  // { address, messages: [{role,content},...], isGreeting? } and expects
+  // { success, content, navHints, routedVia }. We fan it into the same tick
+  // path against a shared "kairos-wallet" agent so the wallet UI keeps its
+  // shape while the reply comes from Kaizen. Same brain, wallet-flavored
+  // presentation via `contextHint`.
+  app.post("/api/agent/chat", async (req, res) => {
+    try {
+      const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+      const isGreeting = !!req.body?.isGreeting;
+      const lastUserMsg = [...messages].reverse().find((m: { role?: string; content?: string }) => m.role === "user");
+      const operatorPrompt = isGreeting
+        ? "El usuario acaba de abrir la wallet Kairos. Saludalo brevemente (1-2 frases), presentate como KairosAgent (powered by Kaizen), y preguntale qué quiere hacer."
+        : (lastUserMsg?.content || "");
+      if (!operatorPrompt.trim() && !isGreeting) {
+        return res.status(400).json({ success: false, error: "empty message" });
+      }
+      // Route through a dedicated wallet-persona agent so its ledger + soul
+      // stay separate from agt_demo. Auto-create on first hit.
+      const walletAgentId = "agt_wallet_kairos";
+      let record = await registry.get(walletAgentId);
+      if (!record) {
+        await createAgent(
+          { agentId: walletAgentId, displayName: "KairosAgent (Kaizen)" },
+          vault, registry, passphrase,
+        );
+        record = await registry.get(walletAgentId);
+      }
+      const balances = await walletService.readBalances(walletAgentId);
+      const agentState = await stateLoader.load(walletAgentId);
+      let gasUsdTotal = 0;
+      for (const [idStr, per] of Object.entries(balances.byChain)) {
+        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+      }
+      const contextualPrompt = [
+        "[CONTEXT: llamado desde la wallet Kairos. Presentate como KairosAgent (powered by Kaizen).",
+        "El usuario está usando la wallet — ofrece acciones concretas de wallet (swap, send, receive, exchange, casino, predict, elite).",
+        "Sé conciso: 2-4 frases máx. No enumeres tu estado interno a menos que te lo pidan.]",
+        "",
+        operatorPrompt,
+      ].join("\n");
+      const result = await decisionLoop.tick({
+        agentId: walletAgentId,
+        operatorPrompt: contextualPrompt,
+        balances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+        agentState,
+      });
+      // Wallet UI expects `content`. Kaizen's tick returns `outcome.reason`
+      // for wait-outcomes and llmContent for tool-execution outcomes.
+      const content = result.llmContent
+        || (result.outcome?.kind === "waited" ? result.outcome.reason : "")
+        || "(sin respuesta)";
+      res.json({
+        success: true,
+        content,
+        navHints: [],
+        routedVia: "kaizen-v0.2",
+        _debug: { kaizen: true, agentId: walletAgentId, outcome: result.outcome?.kind },
+      });
+    } catch (e) {
+      res.status(500).json({ success: false, error: (e as Error).message });
+    }
+  });
+
   return { app, scheduler };
 }
 
