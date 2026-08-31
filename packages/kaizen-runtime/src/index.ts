@@ -32,3 +32,4 @@ export * from "./improvement/index.js";
 export * from "./improvement/versioning.js";
 export * from "./improvement/shadow.js";
 export * from "./types.js";
+export * from "./economic/index.js";
