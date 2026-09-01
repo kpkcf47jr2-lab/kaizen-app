@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { PolicyEngine, HARD_LIMITS, KILL_SWITCH_ENV } from "../../economic/policy-engine.js";
+import { PolicyEngine, POLICY_PROFILES, KILL_SWITCH_ENV } from "../../economic/policy-engine.js";
+
+const HARD_LIMITS = POLICY_PROFILES.PHASE1_INITIAL_TEST;
 
 function snap(over: Partial<{ spent_last_24h_usd: number; reserved_usd: number; wallet_balance_usd: number }> = {}) {
   return {
@@ -13,14 +15,14 @@ function snap(over: Partial<{ spent_last_24h_usd: number; reserved_usd: number; 
 describe("PolicyEngine", () => {
   describe("kill switch", () => {
     it("always wins — refuses every action when env=1", () => {
-      const eng = new PolicyEngine(() => true);
+      const eng = new PolicyEngine(() => true, "PHASE1_INITIAL_TEST");
       const res = eng.evaluate({ kind: "compute_rent", amount_usd: 0.5, reason: "test" }, snap());
       expect(res.allow).toBe(false);
       if (!res.allow) expect(res.kind).toBe("killed");
     });
     it("respects a mid-flight flip", () => {
       let killed = false;
-      const eng = new PolicyEngine(() => killed);
+      const eng = new PolicyEngine(() => killed, "PHASE1_INITIAL_TEST");
       expect(eng.evaluate({ kind: "compute_rent", amount_usd: 1, reason: "x" }, snap()).allow).toBe(true);
       killed = true;
       const res = eng.evaluate({ kind: "compute_rent", amount_usd: 1, reason: "x" }, snap());
@@ -29,7 +31,7 @@ describe("PolicyEngine", () => {
     it("reads real env var by default", () => {
       const prev = process.env[KILL_SWITCH_ENV];
       process.env[KILL_SWITCH_ENV] = "1";
-      const eng = new PolicyEngine();
+      const eng = new PolicyEngine(undefined, "PHASE1_INITIAL_TEST");
       expect(eng.evaluate({ kind: "compute_rent", amount_usd: 1, reason: "x" }, snap()).allow).toBe(false);
       process.env[KILL_SWITCH_ENV] = "";
       expect(eng.evaluate({ kind: "compute_rent", amount_usd: 1, reason: "x" }, snap()).allow).toBe(true);
@@ -38,7 +40,7 @@ describe("PolicyEngine", () => {
   });
 
   describe("single-spend cap", () => {
-    const eng = new PolicyEngine(() => false);
+    const eng = new PolicyEngine(() => false, "PHASE1_INITIAL_TEST");
     it("allows exactly at the cap", () => {
       const res = eng.evaluate({ kind: "compute_rent", amount_usd: HARD_LIMITS.MAX_SINGLE_AUTONOMOUS_SPEND_USD, requested_runtime_minutes: 30, reason: "at cap" }, snap({ wallet_balance_usd: 50 }));
       expect(res.allow).toBe(true);
@@ -51,7 +53,7 @@ describe("PolicyEngine", () => {
   });
 
   describe("daily cumulative cap", () => {
-    const eng = new PolicyEngine(() => false);
+    const eng = new PolicyEngine(() => false, "PHASE1_INITIAL_TEST");
     it("counts spent + reserved + this against MAX_DAILY_CUMULATIVE_SPEND_USD", () => {
       const already = HARD_LIMITS.MAX_DAILY_CUMULATIVE_SPEND_USD - 3;
       const res = eng.evaluate(
@@ -80,7 +82,7 @@ describe("PolicyEngine", () => {
   });
 
   describe("wallet balance", () => {
-    const eng = new PolicyEngine(() => false);
+    const eng = new PolicyEngine(() => false, "PHASE1_INITIAL_TEST");
     it("refuses if amount + reserved exceeds current balance", () => {
       const res = eng.evaluate(
         { kind: "compute_rent", amount_usd: 3, requested_runtime_minutes: 10, reason: "poor" },
@@ -100,7 +102,7 @@ describe("PolicyEngine", () => {
   });
 
   describe("GPU-specific caps", () => {
-    const eng = new PolicyEngine(() => false);
+    const eng = new PolicyEngine(() => false, "PHASE1_INITIAL_TEST");
     it("refuses runtime over MAX_GPU_RUNTIME_MINUTES", () => {
       const res = eng.evaluate(
         { kind: "compute_rent", amount_usd: 1, requested_runtime_minutes: HARD_LIMITS.MAX_GPU_RUNTIME_MINUTES + 1, reason: "long" },
@@ -127,7 +129,7 @@ describe("PolicyEngine", () => {
   });
 
   describe("input sanity", () => {
-    const eng = new PolicyEngine(() => false);
+    const eng = new PolicyEngine(() => false, "PHASE1_INITIAL_TEST");
     it("refuses NaN or negative amount", () => {
       expect(eng.evaluate({ kind: "compute_rent", amount_usd: NaN, reason: "bad" }, snap()).allow).toBe(false);
       expect(eng.evaluate({ kind: "compute_rent", amount_usd: -5, reason: "bad" }, snap()).allow).toBe(false);
@@ -137,7 +139,8 @@ describe("PolicyEngine", () => {
     });
   });
 
-  it("HARD_LIMITS is frozen — Kaizen can't mutate it at runtime", () => {
+  it("profiles are frozen — Kaizen can't mutate limits at runtime", () => {
     expect(() => { (HARD_LIMITS as any).MAX_SINGLE_AUTONOMOUS_SPEND_USD = 9999; }).toThrow();
+    expect(() => { (POLICY_PROFILES as any).PHASE1_INITIAL_TEST = {}; }).toThrow();
   });
 });

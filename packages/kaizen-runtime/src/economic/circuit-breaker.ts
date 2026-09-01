@@ -20,9 +20,7 @@
 //  that is still broken.
 // ═══════════════════════════════════════════════════════════════════════
 
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
+import type { EconomicStore } from "./store.js";
 
 export type BreakerState = "closed" | "open" | "half_open";
 
@@ -55,30 +53,15 @@ export type AllowResult =
   | { allow: false; state: "open"; retry_after_ms: number; reason: string };
 
 export class CircuitBreaker {
-  private readonly db: Database.Database;
+  private readonly db: import("better-sqlite3").Database;
   private readonly failureThreshold: number;
   private readonly baseCooldownMs: number;
   private readonly maxCooldownMs: number;
   private readonly now: () => number;
 
-  constructor(cfg: CircuitBreakerConfig = {}) {
-    const stateDir = cfg.stateDir || path.join(process.cwd(), "data");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = cfg.dbPath || path.join(stateDir, "circuit-breaker.db");
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS breakers (
-        key                  TEXT PRIMARY KEY,
-        state                TEXT NOT NULL CHECK(state IN ('closed','open','half_open')),
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        open_count           INTEGER NOT NULL DEFAULT 0,
-        opened_at            INTEGER,
-        cooldown_ms          INTEGER NOT NULL DEFAULT 0,
-        last_failure_reason  TEXT,
-        updated_at           INTEGER NOT NULL
-      );
-    `);
+  /** Gate #6: shares ONE database with the rest of the economic layer. */
+  constructor(store: EconomicStore, cfg: Omit<CircuitBreakerConfig, "stateDir" | "dbPath"> = {}) {
+    this.db = store.db;
     this.failureThreshold = cfg.failureThreshold ?? 3;
     this.baseCooldownMs = cfg.baseCooldownMs ?? 60_000;
     this.maxCooldownMs = cfg.maxCooldownMs ?? 2 * 3600_000;
@@ -169,5 +152,4 @@ export class CircuitBreaker {
     return this.db.prepare(`SELECT * FROM breakers WHERE key=?`).get(key) as BreakerRow;
   }
 
-  close(): void { this.db.close(); }
 }

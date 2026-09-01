@@ -3,11 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CircuitBreaker } from "../../economic/circuit-breaker.js";
+import { EconomicStore } from "../../economic/store.js";
 
 function fresh(nowRef: { t: number }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kz-cb-"));
-  return new CircuitBreaker({
-    stateDir: dir, failureThreshold: 3, baseCooldownMs: 1000, maxCooldownMs: 60_000,
+  return new CircuitBreaker(new EconomicStore({ stateDir: dir }), {
+    failureThreshold: 3, baseCooldownMs: 1000, maxCooldownMs: 60_000,
     now: () => nowRef.t,
   });
 }
@@ -111,11 +112,12 @@ describe("CircuitBreaker", () => {
   it("state survives a new CircuitBreaker instance on the same dir (crash-loop safety)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kz-cb-persist-"));
     const t = { t: 5_000_000 };
-    const one = new CircuitBreaker({ stateDir: dir, failureThreshold: 2, baseCooldownMs: 10_000, now: () => t.t });
+    const storeOne = new EconomicStore({ stateDir: dir });
+    const one = new CircuitBreaker(storeOne, { failureThreshold: 2, baseCooldownMs: 10_000, now: () => t.t });
     one.recordFailure("p", "x"); one.recordFailure("p", "y");
     expect(one.status("p").state).toBe("open");
-    one.close();
-    const two = new CircuitBreaker({ stateDir: dir, failureThreshold: 2, baseCooldownMs: 10_000, now: () => t.t });
+    storeOne.close();
+    const two = new CircuitBreaker(new EconomicStore({ stateDir: dir }), { failureThreshold: 2, baseCooldownMs: 10_000, now: () => t.t });
     expect(two.status("p").state).toBe("open");     // NOT reset by restart
     expect(two.allow("p").allow).toBe(false);
   });

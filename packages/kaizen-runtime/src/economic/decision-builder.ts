@@ -1,83 +1,72 @@
 // ═══════════════════════════════════════════════════════════════════════
 //  EconomicDecisionBuilder — the ONLY path from LLM intent to money
 //
-//  Owner directive (2026-08-30):
-//    "NO quiero wallet.transfer genérico expuesto libremente al LLM.
-//     El LLM debe solicitar una acción económica estructurada:
-//       Kaizen → Economic Decision → Policy Engine → Budget Check
-//              → Transaction/Payment Builder → Secure Wallet Service
-//              → Execution
-//     El modelo nunca debe decidir arbitrariamente una dirección y
-//     cantidad y enviarla directamente."
+//  Fase-1-rev-1 addresses CEO gate rejections #1, #3, #4, #6.
 //
-//  So: the LLM never calls a spend tool. It emits an EconomicProposal —
-//  a declarative "here is what I want to achieve and why" — and this
-//  builder is the thing that:
-//     1. validates the proposal shape
-//     2. writes a decision to the ledger (audit starts BEFORE any spend)
-//     3. checks the circuit breaker for the target provider
-//     4. runs policy + reserves budget ATOMICALLY
-//     5. dedupes via the idempotency store
-//     6. hands a narrow, fully-specified ExecutionOrder to the executor
-//     7. records the outcome, reconciles cost, releases/commits budget
-//
-//  The executor callback receives an ExecutionOrder that the LLM cannot
-//  author directly — recipient addresses and amounts come from the
-//  provider catalog and the reserved budget, not from model output.
+//  #1  provider_params is BUILT from a typed catalog entry through a
+//      per-provider allowlist. Model-authored `attributes` are recorded
+//      for audit and NEVER reach the executor.
+//  #3  actual_cost_usd is validated (finite, >= 0, <= authorized). An
+//      overcharge routes to BILLING_DISPUTE, never a silent settlement.
+//  #4  maximum_cost_usd < verifiedTotal is REJECTED with the verified
+//      figure returned, instead of producing an underfunded order.
+//  #6  submit() runs dedupe + reserve + ledger transitions inside ONE
+//      EconomicStore transaction, so a crash between them is impossible.
 // ═══════════════════════════════════════════════════════════════════════
 
 import { EconomicEventLedger, type DecisionRecord } from "./event-ledger.js";
 import { BudgetReservation } from "./budget-reservation.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { IdempotencyStore, makeIdempotencyKey } from "./idempotency-store.js";
-import type { EconomicActionKind, PolicyDecision } from "./policy-engine.js";
+import type { EconomicStore } from "./store.js";
+import {
+  validateActualCost, checkNumber,
+  type EconomicActionKind, type PolicyDecision,
+} from "./policy-engine.js";
+import {
+  buildProviderParams, type CatalogEntry, type CatalogSource,
+} from "./provider-catalog.js";
 
 // ── What the LLM is allowed to emit ───────────────────────────────────
-// Note: NO recipient address. NO raw amount to send. The model states
-// intent + constraints; the builder resolves the concrete transaction.
+// No recipient address. No raw amount to send. No executable parameters.
+
+export interface ProposalOption {
+  provider: string;
+  label: string;
+  /** Model's belief about unit price. Verified; never trusted. */
+  unit_cost_usd: number;
+  expected_units: number;
+  expected_total_usd: number;
+  probability_success?: number;
+  /**
+   * Model's free-form annotations. Gate #1: recorded in the ledger for
+   * audit and belief-vs-reality comparison. NEVER forwarded to a provider.
+   */
+  attributes?: Record<string, unknown>;
+}
 
 export interface EconomicProposal {
   kind: EconomicActionKind;
   objective: string;
-  /** Alternatives the model evaluated. Recorded for audit + learning. */
-  options_considered: Array<{
-    provider: string;
-    label: string;
-    /** Unit price the model believes applies. Verified against catalog. */
-    unit_cost_usd: number;
-    /** How many units (hours, impressions, …) it expects to consume. */
-    expected_units: number;
-    /** Model's estimate of total. Recomputed by the builder. */
-    expected_total_usd: number;
-    /** 0..1 — model's belief the option completes successfully. */
-    probability_success?: number;
-    /** Free-form provider attributes (vram_gb, region, latency_ms, …). */
-    attributes?: Record<string, unknown>;
-  }>;
-  /** Index into options_considered. */
+  options_considered: ProposalOption[];
   selected_index: number;
   reason: string;
-  confidence: number;          // 0..1
-  expected_value_usd: number;  // hypothesised benefit, NOT a promise
-  /** Hard ceiling the model accepts for this action. */
+  confidence: number;
+  expected_value_usd: number;
   maximum_cost_usd: number;
-  /** For compute actions. */
   requested_runtime_minutes?: number;
 }
 
-/** What the executor actually receives. Fully resolved; no model freedom. */
 export interface ExecutionOrder {
   decision_id: string;
   operation_id: string;
   reservation_id: string;
   kind: EconomicActionKind;
   provider: string;
-  /** Resolved from the reservation, not from model output. */
   authorized_max_usd: number;
   requested_runtime_minutes?: number;
-  /** Opaque provider-specific params, built from the catalog entry. */
-  provider_params: Record<string, unknown>;
-  /** Pass to the provider so a lost response can be reconciled later. */
+  /** Gate #1: built from the catalog + allowlist. Contains no model data. */
+  provider_params: Record<string, string | number | boolean>;
   external_reference: string;
 }
 
@@ -87,211 +76,311 @@ export interface ExecutionResult {
   provider_instance_id?: string;
   result?: unknown;
   failure_reason?: string;
-  /** True when we could not confirm whether the provider charged us.
-   *  Owner requirement: never release budget in this case. */
+  /** Gate #2: outcome unknown (timeout / lost response). Keeps the
+   *  idempotency key consumed and the budget committed as a liability. */
   cost_uncertain?: boolean;
 }
 
 export type SubmitOutcome =
   | { accepted: true; decision_id: string; order: ExecutionOrder }
-  | { accepted: false; decision_id: string | null; reason: string; policy?: PolicyDecision; retry_after_ms?: number };
+  | {
+      accepted: false; decision_id: string | null; reason: string;
+      policy?: PolicyDecision; retry_after_ms?: number;
+      /** Gate #4: when the ceiling was too low, tell the caller the real number. */
+      verified_total_usd?: number;
+      /** Gate #2: what the caller must do before retrying. */
+      guidance?: string;
+      external_reference?: string | null;
+    };
 
 export interface DecisionBuilderDeps {
+  store: EconomicStore;
   ledger: EconomicEventLedger;
   budget: BudgetReservation;
   breaker: CircuitBreaker;
   idempotency: IdempotencyStore;
-  /** Reads the live wallet balance. Async network call, done OUTSIDE the txn. */
+  catalog: CatalogSource;
   readWalletBalanceUsd: (agent_id: string) => Promise<number>;
-  /** Authoritative provider catalog — the model's prices are never trusted. */
-  resolveCatalogPrice: (provider: string, label: string) => Promise<number | null>;
 }
 
 export class EconomicDecisionBuilder {
   constructor(private readonly deps: DecisionBuilderDeps) {}
 
-  /**
-   * Validate + admit a proposal. Returns an ExecutionOrder only when every
-   * gate passes. Nothing is spent here — the caller then runs the order
-   * through the executor and reports back via `settle()`.
-   */
   async submit(agent_id: string, proposal: EconomicProposal): Promise<SubmitOutcome> {
-    // ── Gate 0: proposal shape ───────────────────────────────────────
+    // ── Gate 0: proposal shape + numeric ranges ──────────────────────
     const shapeErr = validateProposal(proposal);
     if (shapeErr) return { accepted: false, decision_id: null, reason: `invalid proposal: ${shapeErr}` };
 
     const chosen = proposal.options_considered[proposal.selected_index]!;
 
-    // ── Gate 1: verify price against the authoritative catalog ───────
-    // The model may hallucinate a price. We recompute from the catalog and
-    // use OUR number for everything downstream.
-    const catalogUnit = await this.deps.resolveCatalogPrice(chosen.provider, chosen.label);
-    if (catalogUnit === null) {
-      return { accepted: false, decision_id: null, reason: `provider/option not in catalog: ${chosen.provider}/${chosen.label}` };
+    // ── Gate 1: authoritative catalog lookup ─────────────────────────
+    const entry = await this.deps.catalog.lookup(chosen.provider, chosen.label);
+    if (!entry) {
+      return { accepted: false, decision_id: null,
+        reason: `provider/option not in catalog: ${chosen.provider}/${chosen.label}` };
     }
-    const verifiedTotal = round2(catalogUnit * chosen.expected_units);
-    // If the model's estimate was materially wrong, keep going but record it.
+    if (entry.availability === "unavailable") {
+      return { accepted: false, decision_id: null,
+        reason: `catalog entry ${entry.provider}/${entry.label} is unavailable` };
+    }
+
+    // Price comes from the catalog, never from the model.
+    const verifiedTotal = round2(entry.unit_cost_usd * chosen.expected_units);
     const priceDrift = round2(Math.abs(verifiedTotal - chosen.expected_total_usd));
 
-    // Never authorize more than the model's own stated ceiling, nor more
-    // than the verified total plus a small buffer for provider rounding.
-    const authorized_max_usd = round2(Math.min(
-      proposal.maximum_cost_usd,
-      verifiedTotal * 1.15,
-    ));
-
-    // ── Write the decision to the ledger BEFORE any spend gate ───────
-    const decision = this.deps.ledger.createDecision({
-      agent_id,
-      objective: proposal.objective,
-      available_capital_usd: await this.deps.readWalletBalanceUsd(agent_id),
-      options_considered: proposal.options_considered,
-      reason: proposal.reason,
-      confidence: proposal.confidence,
-      expected_cost_usd: verifiedTotal,
-      maximum_cost_usd: authorized_max_usd,
-      expected_value_usd: proposal.expected_value_usd,
-      actor: "kaizen",
-    });
-
-    // ── Gate 2: circuit breaker for this provider ────────────────────
-    const breakerKey = `provider:${chosen.provider}`;
-    const gate = this.deps.breaker.allow(breakerKey);
-    if (!gate.allow) {
-      this.deps.ledger.transition({
-        decision_id: decision.decision_id, to_state: "POLICY_REJECTED", actor: "system",
-        patch: { failure_reason: gate.reason },
-        data: { gate: "circuit_breaker", retry_after_ms: gate.retry_after_ms },
-      });
-      return { accepted: false, decision_id: decision.decision_id, reason: gate.reason, retry_after_ms: gate.retry_after_ms };
+    // ── Gate 4: refuse an underfunded order ──────────────────────────
+    if (proposal.maximum_cost_usd < verifiedTotal) {
+      return {
+        accepted: false, decision_id: null,
+        reason: `maximum_cost_usd $${proposal.maximum_cost_usd.toFixed(2)} is below the verified cost $${verifiedTotal.toFixed(2)} for ${entry.provider}/${entry.label}. Raise the ceiling or choose a cheaper option.`,
+        verified_total_usd: verifiedTotal,
+      };
     }
 
-    // ── Gate 3: idempotency ──────────────────────────────────────────
+    // Authorize the verified cost plus a small buffer, never more than the
+    // model's own stated ceiling.
+    const authorized_max_usd = round2(Math.min(proposal.maximum_cost_usd, verifiedTotal * 1.15));
+
+    const walletUsd = await this.deps.readWalletBalanceUsd(agent_id);
+    const walletIssue = checkNumber("wallet_balance_usd", walletUsd, { min: 0, max: 1_000_000 });
+    if (walletIssue) {
+      return { accepted: false, decision_id: null,
+        reason: `wallet read invalid: ${walletIssue.field} ${walletIssue.reason}` };
+    }
+
+    // Gate #1: executable params projected from the catalog through the
+    // allowlist. `chosen.attributes` is deliberately NOT part of this.
+    const { params: provider_params, dropped } = buildProviderParams(entry, chosen.expected_units);
+
     const idemKey = makeIdempotencyKey({
       tool: `economic:${proposal.kind}`,
-      args: { provider: chosen.provider, label: chosen.label, units: chosen.expected_units, objective: proposal.objective },
+      args: { provider: entry.provider, label: entry.label, units: chosen.expected_units, objective: proposal.objective },
       actor: agent_id,
       bucket_seconds: 3600,
     });
-    const begin = this.deps.idempotency.begin({
-      tool: `economic:${proposal.kind}`, key: idemKey, actor: agent_id,
-      metadata: { decision_id: decision.decision_id, provider: chosen.provider },
-    });
-    if (!begin.fresh) {
-      this.deps.ledger.transition({
-        decision_id: decision.decision_id, to_state: "CANCELLED", actor: "system",
-        patch: { failure_reason: `duplicate of operation ${begin.operation_id} (state=${begin.state})` },
-        data: { gate: "idempotency", existing_operation_id: begin.operation_id },
-      });
-      return {
-        accepted: false, decision_id: decision.decision_id,
-        reason: `duplicate economic action; existing operation ${begin.operation_id} is ${begin.state}`,
-        retry_after_ms: begin.retry_after_ms,
-      };
-    }
 
-    // ── Gate 4: policy + atomic budget reservation ───────────────────
-    const walletUsd = await this.deps.readWalletBalanceUsd(agent_id);
-    const reserved = this.deps.budget.reserve({
-      decision_id: decision.decision_id,
-      agent_id,
-      walletBalanceUsd: walletUsd,
-      request: {
-        kind: proposal.kind,
-        amount_usd: authorized_max_usd,
-        requested_runtime_minutes: proposal.requested_runtime_minutes,
+    // ── Gate 6: ONE transaction for ledger + dedupe + reserve ────────
+    // Everything below either all commits or all rolls back.
+    type TxnOutcome =
+      | { kind: "ok"; decision_id: string; operation_id: string; reservation_id: string }
+      | { kind: "breaker"; decision_id: string; reason: string; retry_after_ms: number }
+      | { kind: "dup"; decision_id: string; reason: string; retry_after_ms?: number; guidance?: string; external_reference?: string | null }
+      | { kind: "policy"; decision_id: string; policy: PolicyDecision };
+
+    const txnResult: TxnOutcome = this.deps.store.atomic((): TxnOutcome => {
+      // Audit starts before any gate, so even a rejection is recorded.
+      const decision = this.deps.ledger.createDecision({
+        agent_id,
+        objective: proposal.objective,
+        available_capital_usd: walletUsd,
+        options_considered: proposal.options_considered,
         reason: proposal.reason,
-      },
-    });
-    if (!reserved.ok) {
-      this.deps.idempotency.rollback(begin.operation_id, "policy rejected");
-      this.deps.ledger.transition({
-        decision_id: decision.decision_id, to_state: "POLICY_REJECTED", actor: "policy",
-        patch: { policy_result: reserved.policy, failure_reason: reserved.policy.allow ? null : reserved.policy.reason },
+        confidence: proposal.confidence,
+        expected_cost_usd: verifiedTotal,
+        maximum_cost_usd: authorized_max_usd,
+        expected_value_usd: proposal.expected_value_usd,
+        actor: "kaizen",
       });
-      return {
-        accepted: false, decision_id: decision.decision_id,
-        reason: reserved.policy.allow ? "unknown" : reserved.policy.reason,
-        policy: reserved.policy,
-      };
+      const external_reference = `kaizen-${decision.decision_id}`;
+
+      // Gate 2 — circuit breaker
+      const gate = this.deps.breaker.allow(`provider:${entry.provider}`);
+      if (!gate.allow) {
+        this.deps.ledger.transition({
+          decision_id: decision.decision_id, to_state: "POLICY_REJECTED", actor: "system",
+          patch: { failure_reason: gate.reason },
+          data: { gate: "circuit_breaker", retry_after_ms: gate.retry_after_ms },
+        });
+        return { kind: "breaker", decision_id: decision.decision_id, reason: gate.reason, retry_after_ms: gate.retry_after_ms };
+      }
+
+      // Gate 3 — idempotency (blocking states include failed + uncertain)
+      const begin = this.deps.idempotency.begin({
+        tool: `economic:${proposal.kind}`, key: idemKey, actor: agent_id,
+        metadata: { decision_id: decision.decision_id, provider: entry.provider },
+        external_reference,
+      });
+      if (!begin.fresh) {
+        this.deps.ledger.transition({
+          decision_id: decision.decision_id, to_state: "CANCELLED", actor: "system",
+          patch: { failure_reason: `duplicate of operation ${begin.operation_id} (state=${begin.state})` },
+          data: { gate: "idempotency", existing_operation_id: begin.operation_id, existing_state: begin.state },
+        });
+        return {
+          kind: "dup", decision_id: decision.decision_id,
+          reason: `duplicate economic action; existing operation ${begin.operation_id} is ${begin.state}`,
+          retry_after_ms: begin.retry_after_ms,
+          guidance: begin.guidance,
+          external_reference: begin.external_reference,
+        };
+      }
+
+      // Gate 4 — policy + atomic reservation
+      const reserved = this.deps.budget.reserveWithin({
+        decision_id: decision.decision_id,
+        agent_id,
+        walletBalanceUsd: walletUsd,
+        request: {
+          kind: proposal.kind,
+          amount_usd: authorized_max_usd,
+          requested_runtime_minutes: proposal.requested_runtime_minutes,
+          reason: proposal.reason,
+        },
+      });
+      if (!reserved.ok) {
+        this.deps.idempotency.rollback(begin.operation_id, "policy rejected — no side effect");
+        this.deps.ledger.transition({
+          decision_id: decision.decision_id, to_state: "POLICY_REJECTED", actor: "policy",
+          patch: { policy_result: reserved.policy, failure_reason: reserved.policy.allow ? null : reserved.policy.reason },
+        });
+        return { kind: "policy", decision_id: decision.decision_id, policy: reserved.policy };
+      }
+
+      this.deps.ledger.transition({
+        decision_id: decision.decision_id, to_state: "POLICY_APPROVED", actor: "policy",
+        patch: {
+          policy_result: reserved.policy,
+          provider: entry.provider,
+          selected_option: {
+            // What the model claimed
+            model_claimed: { ...chosen },
+            // What we verified
+            verified: {
+              provider: entry.provider, label: entry.label,
+              unit_cost_usd: entry.unit_cost_usd, unit: entry.unit,
+              spec: entry.spec, total_usd: verifiedTotal,
+            },
+            price_drift_usd: priceDrift,
+            // Gate #1 evidence: what the allowlist dropped
+            provider_params_sent: provider_params,
+            provider_params_dropped: dropped,
+            model_attributes_ignored: chosen.attributes ?? null,
+          },
+        },
+      });
+      this.deps.ledger.transition({
+        decision_id: decision.decision_id, to_state: "BUDGET_RESERVED", actor: "kaizen",
+        patch: { reserved_capital_usd: authorized_max_usd },
+        data: { reservation_id: reserved.reservation_id },
+      });
+
+      return { kind: "ok", decision_id: decision.decision_id, operation_id: begin.operation_id, reservation_id: reserved.reservation_id };
+    });
+
+    switch (txnResult.kind) {
+      case "breaker":
+        return { accepted: false, decision_id: txnResult.decision_id, reason: txnResult.reason, retry_after_ms: txnResult.retry_after_ms };
+      case "dup":
+        return {
+          accepted: false, decision_id: txnResult.decision_id, reason: txnResult.reason,
+          retry_after_ms: txnResult.retry_after_ms, guidance: txnResult.guidance,
+          external_reference: txnResult.external_reference,
+        };
+      case "policy":
+        return {
+          accepted: false, decision_id: txnResult.decision_id,
+          reason: txnResult.policy.allow ? "unknown" : txnResult.policy.reason,
+          policy: txnResult.policy,
+        };
+      case "ok":
+        return {
+          accepted: true,
+          decision_id: txnResult.decision_id,
+          order: {
+            decision_id: txnResult.decision_id,
+            operation_id: txnResult.operation_id,
+            reservation_id: txnResult.reservation_id,
+            kind: proposal.kind,
+            provider: entry.provider,
+            authorized_max_usd,
+            requested_runtime_minutes: proposal.requested_runtime_minutes,
+            provider_params,
+            external_reference: `kaizen-${txnResult.decision_id}`,
+          },
+        };
     }
-
-    // ── Admitted. Move the decision through APPROVED → RESERVED ──────
-    this.deps.ledger.transition({
-      decision_id: decision.decision_id, to_state: "POLICY_APPROVED", actor: "policy",
-      patch: { policy_result: reserved.policy, selected_option: { ...chosen, verified_unit_cost_usd: catalogUnit, verified_total_usd: verifiedTotal, price_drift_usd: priceDrift }, provider: chosen.provider },
-    });
-    this.deps.ledger.transition({
-      decision_id: decision.decision_id, to_state: "BUDGET_RESERVED", actor: "kaizen",
-      patch: { reserved_capital_usd: authorized_max_usd },
-      data: { reservation_id: reserved.reservation_id },
-    });
-
-    const order: ExecutionOrder = {
-      decision_id: decision.decision_id,
-      operation_id: begin.operation_id,
-      reservation_id: reserved.reservation_id,
-      kind: proposal.kind,
-      provider: chosen.provider,
-      authorized_max_usd,
-      requested_runtime_minutes: proposal.requested_runtime_minutes,
-      provider_params: { label: chosen.label, units: chosen.expected_units, ...(chosen.attributes ?? {}) },
-      // Given to the provider so a lost HTTP response can be reconciled.
-      external_reference: `kaizen-${decision.decision_id}`,
-    };
-    return { accepted: true, decision_id: decision.decision_id, order };
   }
 
   /**
-   * Report the outcome of executing an order. Handles the owner's rule:
-   * a cost-uncertain failure becomes a committed LIABILITY, never a release.
+   * Report the outcome. Gate #3 validates the charge; an overcharge or a
+   * malformed number routes to BILLING_DISPUTE rather than settling.
    */
   settle(order: ExecutionOrder, result: ExecutionResult): DecisionRecord {
     const breakerKey = `provider:${order.provider}`;
 
-    if (result.ok) {
+    // ── Uncertain outcome (gate #2) ──────────────────────────────────
+    if (result.cost_uncertain) {
+      return this.deps.store.atomic(() => {
+        this.deps.breaker.recordFailure(breakerKey, result.failure_reason ?? "outcome unknown");
+        // Key stays consumed until an explicit reconcile().
+        this.deps.idempotency.markUncertain(
+          order.operation_id,
+          result.failure_reason ?? "response lost / timeout",
+          order.external_reference,
+        );
+        this.deps.budget.commitAsLiability(
+          order.reservation_id, order.authorized_max_usd,
+          result.failure_reason ?? "cost could not be confirmed",
+        );
+        return this.deps.ledger.transition({
+          decision_id: order.decision_id, to_state: "BILLING_DISPUTE", actor: "system",
+          patch: { failure_reason: result.failure_reason ?? "cost uncertain", actual_cost_usd: order.authorized_max_usd },
+          data: { external_reference: order.external_reference, requires_reconciliation: true },
+        });
+      });
+    }
+
+    // ── Failure with a confirmed no-charge ───────────────────────────
+    if (!result.ok) {
+      return this.deps.store.atomic(() => {
+        this.deps.breaker.recordFailure(breakerKey, result.failure_reason ?? "unknown failure");
+        // Confirmed no side effect → the key may be freed for a retry.
+        this.deps.idempotency.rollback(order.operation_id, result.failure_reason ?? "execution failed, no charge");
+        this.deps.budget.release(order.reservation_id, result.failure_reason ?? "execution failed, no charge");
+        return this.deps.ledger.transition({
+          decision_id: order.decision_id, to_state: "CLOSED", actor: "system",
+          patch: { failure_reason: result.failure_reason ?? "execution failed", actual_cost_usd: 0 },
+        });
+      });
+    }
+
+    // ── Success — gate #3 validates the charge ───────────────────────
+    const costCheck = validateActualCost(result.actual_cost_usd ?? order.authorized_max_usd, order.authorized_max_usd);
+    if (!costCheck.ok) {
+      return this.deps.store.atomic(() => {
+        // An overcharge is a billing problem, not a normal settlement.
+        this.deps.breaker.recordFailure(breakerKey, costCheck.reason);
+        this.deps.idempotency.markUncertain(order.operation_id, costCheck.reason, order.external_reference);
+        // Consume the authorized ceiling; the excess is disputed.
+        this.deps.budget.commitAsLiability(order.reservation_id, order.authorized_max_usd, costCheck.reason);
+        return this.deps.ledger.transition({
+          decision_id: order.decision_id, to_state: "BILLING_DISPUTE", actor: "system",
+          patch: {
+            failure_reason: costCheck.reason,
+            actual_cost_usd: typeof result.actual_cost_usd === "number" && Number.isFinite(result.actual_cost_usd)
+              ? result.actual_cost_usd : order.authorized_max_usd,
+            actual_result: result.result ?? null,
+          },
+          data: { overcharge: costCheck.overcharge === true, authorized_max_usd: order.authorized_max_usd, claimed_cost: result.actual_cost_usd },
+        });
+      });
+    }
+
+    const actual = round2(costCheck.value);
+    return this.deps.store.atomic(() => {
       this.deps.breaker.recordSuccess(breakerKey);
       this.deps.idempotency.commit(order.operation_id, result.provider_instance_id ?? null);
-      const actual = round2(result.actual_cost_usd ?? order.authorized_max_usd);
       this.deps.budget.commit(order.reservation_id, actual);
-      // TERMINATED → RECONCILED → CLOSED
       const cur = this.deps.ledger.get(order.decision_id)!;
-      if (cur.state !== "TERMINATED") {
-        // Caller may not have walked every state; jump legally where possible.
-        // The executor is expected to drive PROVIDER_REQUESTED..TERMINATED.
-      }
       this.deps.ledger.transition({
         decision_id: order.decision_id, to_state: "RECONCILED", actor: "system",
         patch: {
           actual_cost_usd: actual,
           actual_result: result.result ?? null,
-          profit_or_utility_usd: round2((this.deps.ledger.get(order.decision_id)!.expected_value_usd) - actual),
+          profit_or_utility_usd: round2(cur.expected_value_usd - actual),
         },
       });
       return this.deps.ledger.transition({ decision_id: order.decision_id, to_state: "CLOSED", actor: "system" });
-    }
-
-    // ── Failure path ─────────────────────────────────────────────────
-    this.deps.breaker.recordFailure(breakerKey, result.failure_reason ?? "unknown failure");
-    this.deps.idempotency.fail(order.operation_id, result.failure_reason ?? "unknown failure");
-
-    if (result.cost_uncertain) {
-      // Owner rule: budget stays consumed while infra may still bill.
-      this.deps.budget.commitAsLiability(
-        order.reservation_id, order.authorized_max_usd,
-        result.failure_reason ?? "cost could not be confirmed",
-      );
-      return this.deps.ledger.transition({
-        decision_id: order.decision_id, to_state: "BILLING_DISPUTE", actor: "system",
-        patch: { failure_reason: result.failure_reason ?? "cost uncertain", actual_cost_usd: order.authorized_max_usd },
-      });
-    }
-
-    // Confirmed no charge — safe to free the capital.
-    this.deps.budget.release(order.reservation_id, result.failure_reason ?? "execution failed, no charge");
-    return this.deps.ledger.transition({
-      decision_id: order.decision_id, to_state: "CLOSED", actor: "system",
-      patch: { failure_reason: result.failure_reason ?? "execution failed", actual_cost_usd: 0 },
     });
   }
 }
@@ -307,12 +396,25 @@ export function validateProposal(p: EconomicProposal): string | null {
   if (!Number.isInteger(p.selected_index) || p.selected_index < 0 || p.selected_index >= p.options_considered.length) {
     return `selected_index ${p.selected_index} out of range (0..${p.options_considered.length - 1})`;
   }
-  if (typeof p.confidence !== "number" || p.confidence < 0 || p.confidence > 1) return "confidence must be 0..1";
-  if (!Number.isFinite(p.maximum_cost_usd) || p.maximum_cost_usd <= 0) return "maximum_cost_usd must be > 0";
-  if (!Number.isFinite(p.expected_value_usd)) return "expected_value_usd must be finite";
+  const conf = checkNumber("confidence", p.confidence, { min: 0, max: 1 });
+  if (conf) return `${conf.field} ${conf.reason}`;
+  const maxCost = checkNumber("maximum_cost_usd", p.maximum_cost_usd, { min: 0.000001, max: 1_000_000 });
+  if (maxCost) return `${maxCost.field} ${maxCost.reason}`;
+  const ev = checkNumber("expected_value_usd", p.expected_value_usd, { min: -1_000_000, max: 1_000_000 });
+  if (ev) return `${ev.field} ${ev.reason}`;
+  if (p.requested_runtime_minutes !== undefined) {
+    const rt = checkNumber("requested_runtime_minutes", p.requested_runtime_minutes, { min: 0, max: 60 * 24 * 30 });
+    if (rt) return `${rt.field} ${rt.reason}`;
+  }
   const chosen = p.options_considered[p.selected_index]!;
   if (!chosen.provider || !chosen.label) return "selected option needs provider + label";
-  if (!Number.isFinite(chosen.unit_cost_usd) || chosen.unit_cost_usd < 0) return "unit_cost_usd invalid";
-  if (!Number.isFinite(chosen.expected_units) || chosen.expected_units <= 0) return "expected_units must be > 0";
+  const unit = checkNumber("unit_cost_usd", chosen.unit_cost_usd, { min: 0, max: 1_000_000 });
+  if (unit) return `${unit.field} ${unit.reason}`;
+  const units = checkNumber("expected_units", chosen.expected_units, { min: 0.000001, max: 1_000_000 });
+  if (units) return `${units.field} ${units.reason}`;
+  if (chosen.probability_success !== undefined) {
+    const ps = checkNumber("probability_success", chosen.probability_success, { min: 0, max: 1 });
+    if (ps) return `${ps.field} ${ps.reason}`;
+  }
   return null;
 }

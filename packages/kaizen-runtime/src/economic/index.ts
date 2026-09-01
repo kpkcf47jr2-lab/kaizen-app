@@ -1,41 +1,57 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  economic/ — Economic Foundation Layer (Fase 1)
+//  economic/ — Economic Foundation Layer (Fase 1, rev 1)
 //
-//  Everything Kaizen needs to move money safely. Nothing here executes a
-//  payment on its own; this layer decides WHETHER an economic action is
-//  allowed, reserves the capital atomically, dedupes it, records it, and
-//  hands the executor a narrow order it cannot widen.
-//
-//  Wiring order for a caller:
-//     EconomicDecisionBuilder.submit(agent, proposal)
-//        → validates shape
-//        → verifies price against the authoritative catalog
-//        → writes DECISION_CREATED to the ledger
-//        → CircuitBreaker.allow(provider)
-//        → IdempotencyStore.begin(key)
-//        → BudgetReservation.reserve()  [PolicyEngine inside, atomic]
-//        → returns ExecutionOrder
-//     <caller executes the order against the provider>
-//     EconomicDecisionBuilder.settle(order, result)
-//        → commits/releases budget, closes ledger, updates breaker
+//  Rev 1 addresses the CEO's 10 gate corrections. Notably:
+//   #1 provider params come from a typed catalog + allowlist, never from
+//      model-authored `attributes`
+//   #2 failed/uncertain keep the idempotency key consumed until reconcile()
+//   #3 actual_cost is validated; overcharges go to BILLING_DISPUTE
+//   #4 an under-funded ceiling is rejected with the verified figure
+//   #5 decision_events is append-only via SQLite triggers, no CASCADE
+//   #6 ONE database, ONE transaction across ledger + dedupe + reserve
+//   #8 owner-selected policy profiles incl. UNRESTRICTED_OWNER_MODE
+//   #9 finite/range validation on every numeric that touches money
 // ═══════════════════════════════════════════════════════════════════════
+
+export { EconomicStore, type EconomicStoreConfig } from "./store.js";
 
 export {
   PolicyEngine,
-  HARD_LIMITS,
+  POLICY_PROFILES,
+  DEFAULT_PROFILE,
+  resolveProfileName,
+  checkNumber,
+  validateRequest,
+  validateSnapshot,
+  validateActualCost,
   KILL_SWITCH_ENV,
+  POLICY_PROFILE_ENV,
+  type PolicyLimits,
+  type PolicyProfileName,
   type EconomicActionKind,
   type EconomicActionRequest,
   type PolicySnapshot,
   type PolicyDecision,
   type PolicyRejectionKind,
+  type RangeIssue,
 } from "./policy-engine.js";
+
+export {
+  StaticProviderCatalog,
+  DRY_RUN_CATALOG,
+  PROVIDER_PARAM_ALLOWLIST,
+  buildProviderParams,
+  type CatalogEntry,
+  type CatalogSource,
+} from "./provider-catalog.js";
 
 export {
   IdempotencyStore,
   makeIdempotencyKey,
   canonicalizeArgs,
   newOperationId,
+  BLOCKING_STATES,
+  RELEASING_STATES,
   type OpState,
   type BeginResult,
   type OperationRow,
@@ -64,12 +80,14 @@ export {
   type BreakerState,
   type BreakerRow,
   type AllowResult,
+  type CircuitBreakerConfig,
 } from "./circuit-breaker.js";
 
 export {
   EconomicDecisionBuilder,
   validateProposal,
   type EconomicProposal,
+  type ProposalOption,
   type ExecutionOrder,
   type ExecutionResult,
   type SubmitOutcome,

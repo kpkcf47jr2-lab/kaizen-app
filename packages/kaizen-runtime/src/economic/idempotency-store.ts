@@ -1,50 +1,54 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  IdempotencyStore — prevent duplicate economic operations
+//  IdempotencyStore — duplicate prevention with reconciliation gating
 //
-//  Owner directive (2026-08-30): "Si el heartbeat corre dos veces, hay
-//  network retry o el LLM repite una tool call, el sistema NO puede
-//  alquilar dos GPUs accidentalmente / pagar dos veces / duplicar orden."
+//  CEO gate rejection #2 (2026-08-30):
+//    "Hacer que `failed` y cualquier resultado `cost_uncertain` conserven
+//     consumida la clave de idempotencia hasta reconciliación explícita.
+//     Añadir prueba que demuestre que un timeout o respuesta perdida no
+//     puede crear un segundo alquiler."
 //
-//  Contract:
-//    - Every economic operation carries an operation_id (UUID v4) AND an
-//      idempotency_key. The key is a deterministic hash of
-//      { tool, args_canonical, actor, time_bucket }. Two calls in the same
-//      bucket with the same args produce the same key.
-//    - `begin(op_id, key)` atomically inserts a `pending` row. If the same
-//      key already exists in a non-terminal state, the call is REFUSED —
-//      that's the duplicate. The existing row's id is returned so the
-//      caller can await/inspect it.
-//    - `commit(op_id, result_hash?)` marks a pending row committed.
-//    - `rollback(op_id, reason)` marks it rolled_back and frees the key.
-//    - `fail(op_id, reason)` marks it failed; the key stays consumed
-//      unless caller decides to release it via `expire()`.
+//  State machine:
+//     pending    → in flight; BLOCKS the key
+//     committed  → succeeded;  BLOCKS the key
+//     failed     → failed with unknown side effects; BLOCKS the key
+//     uncertain  → response lost / timeout; BLOCKS the key  ← the dangerous one
+//     rolled_back→ PROVEN no side effect; key is FREE
+//     reconciled → a human or a provider query resolved it; key is FREE
 //
-//  Persistence: SQLite with a UNIQUE constraint on (tool, idempotency_key)
-//  scoped to non-terminal states. Uses better-sqlite3 which is synchronous
-//  and single-writer — inherently safe for our workload.
+//  The unique index covers pending|committed|failed|uncertain. So a network
+//  timeout on `compute.rent` leaves the key consumed: the retry is refused
+//  and the caller is handed the original operation_id plus the
+//  external_reference it should use to ASK the provider what really
+//  happened. Only after that answer does anyone call reconcile().
 //
-//  Time bucketing: default 1-hour window. Configurable per operation kind
-//  to allow e.g. daily-unique campaigns vs minute-unique tool retries.
+//  Owner requirement #6 (atomicity): this class no longer opens its own
+//  database. It takes the shared EconomicStore so dedupe + reserve + ledger
+//  commit or roll back together.
 // ═══════════════════════════════════════════════════════════════════════
 
 import { createHash, randomUUID } from "node:crypto";
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
+import type { EconomicStore } from "./store.js";
 
-export type OpState = "pending" | "committed" | "rolled_back" | "failed";
+export type OpState =
+  | "pending" | "committed" | "failed" | "uncertain" | "rolled_back" | "reconciled";
 
-/** Returned by `begin()`. */
+/** States that keep the idempotency key consumed (retry refused). */
+export const BLOCKING_STATES: readonly OpState[] = ["pending", "committed", "failed", "uncertain"];
+/** States that free the key for a legitimate retry. */
+export const RELEASING_STATES: readonly OpState[] = ["rolled_back", "reconciled"];
+
 export interface BeginResult {
-  /** true if this is a fresh operation you should execute. */
   fresh: boolean;
-  /** The operation row (either the one you just created, or the duplicate). */
   operation_id: string;
   state: OpState;
   key: string;
   created_at: number;
-  /** When fresh=false: how many ms until you can retry the same key. */
   retry_after_ms?: number;
+  /** Present when fresh=false and the blocking op has one — the caller
+   *  should query the provider with this before deciding anything. */
+  external_reference?: string | null;
+  /** Human-actionable next step when a duplicate is refused. */
+  guidance?: string;
 }
 
 export interface OperationRow {
@@ -55,13 +59,14 @@ export interface OperationRow {
   created_at: number;
   updated_at: number;
   actor: string;
-  metadata: string;                // JSON blob
-  result_hash: string | null;      // set on commit()
-  fail_reason: string | null;      // set on fail()/rollback()
+  metadata: string;
+  result_hash: string | null;
+  fail_reason: string | null;
+  external_reference: string | null;
+  reconciled_at: number | null;
+  reconcile_note: string | null;
 }
 
-/** Canonicalize a JSON-ish args object so { a: 1, b: 2 } and { b: 2, a: 1 }
- *  produce the same hash. Excludes fields listed in `ignore`. */
 export function canonicalizeArgs(args: unknown, ignore: string[] = []): string {
   const seen = new WeakSet<object>();
   const sortKeys = (v: unknown): unknown => {
@@ -80,17 +85,12 @@ export function canonicalizeArgs(args: unknown, ignore: string[] = []): string {
   return JSON.stringify(sortKeys(args));
 }
 
-/** Deterministic key for idempotency. Time bucket rounds to bucket_seconds. */
 export function makeIdempotencyKey(params: {
-  tool: string;
-  args: unknown;
-  actor: string;
-  now_ms?: number;
-  bucket_seconds?: number;
-  ignore_arg_keys?: string[];
+  tool: string; args: unknown; actor: string;
+  now_ms?: number; bucket_seconds?: number; ignore_arg_keys?: string[];
 }): string {
   const now = params.now_ms ?? Date.now();
-  const bucket_s = params.bucket_seconds ?? 3600;   // 1h default
+  const bucket_s = params.bucket_seconds ?? 3600;
   const bucket = Math.floor(now / 1000 / bucket_s);
   const canonical = canonicalizeArgs(params.args, params.ignore_arg_keys);
   const h = createHash("sha256");
@@ -101,140 +101,154 @@ export function makeIdempotencyKey(params: {
   return h.digest("hex");
 }
 
-export function newOperationId(): string {
-  return randomUUID();
-}
-
-// ── Store ─────────────────────────────────────────────────────────────
-
-export interface IdempotencyStoreConfig {
-  dbPath?: string;         // default: <stateDir>/idempotency.db
-  stateDir?: string;
-}
+export function newOperationId(): string { return randomUUID(); }
 
 export class IdempotencyStore {
-  private readonly db: Database.Database;
+  constructor(private readonly store: EconomicStore) {}
 
-  constructor(cfg: IdempotencyStoreConfig = {}) {
-    const stateDir = cfg.stateDir || path.join(process.cwd(), "data");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = cfg.dbPath || path.join(stateDir, "idempotency.db");
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS operations (
-        operation_id TEXT PRIMARY KEY,
-        tool         TEXT NOT NULL,
-        key          TEXT NOT NULL,
-        state        TEXT NOT NULL CHECK(state IN ('pending','committed','rolled_back','failed')),
-        created_at   INTEGER NOT NULL,
-        updated_at   INTEGER NOT NULL,
-        actor        TEXT NOT NULL,
-        metadata     TEXT NOT NULL DEFAULT '{}',
-        result_hash  TEXT,
-        fail_reason  TEXT
-      );
-      -- Enforce uniqueness on (tool, key) only for non-terminal-in-a-conflicting-way
-      -- states. pending + committed BLOCK further attempts with the same key.
-      -- rolled_back + failed do NOT block — the caller can retry.
-      CREATE UNIQUE INDEX IF NOT EXISTS operations_key_active
-        ON operations(tool, key) WHERE state IN ('pending','committed');
-      CREATE INDEX IF NOT EXISTS operations_state_updated
-        ON operations(state, updated_at);
-    `);
-  }
-
-  /**
-   * Atomically insert a new pending operation with the given key.
-   * If a row with that (tool, key) already exists in pending/committed state,
-   * returns { fresh: false, ... } pointing at the existing row.
-   */
+  /** Insert a pending op, or report the blocking duplicate. */
   begin(params: {
-    tool: string;
-    key: string;
-    actor: string;
+    tool: string; key: string; actor: string;
     metadata?: Record<string, unknown>;
+    external_reference?: string;
     ttl_seconds?: number;
   }): BeginResult {
     const op_id = newOperationId();
     const now = Date.now();
-    const metaJson = JSON.stringify(params.metadata ?? {});
     const ttl_ms = (params.ttl_seconds ?? 3600) * 1000;
-    // Try insert. Rely on UNIQUE INDEX to enforce dedup.
     try {
-      this.db.prepare(`
-        INSERT INTO operations (operation_id, tool, key, state, created_at, updated_at, actor, metadata)
-        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
-      `).run(op_id, params.tool, params.key, now, now, params.actor, metaJson);
+      this.store.db.prepare(`
+        INSERT INTO operations (operation_id, tool, key, state, created_at, updated_at, actor, metadata, external_reference)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+      `).run(op_id, params.tool, params.key, now, now, params.actor,
+             JSON.stringify(params.metadata ?? {}), params.external_reference ?? null);
       return { fresh: true, operation_id: op_id, state: "pending", key: params.key, created_at: now };
     } catch (e) {
-      // Presume UNIQUE-constraint violation. Fetch the winner.
-      const existing = this.db.prepare(`
-        SELECT operation_id, state, created_at FROM operations
-         WHERE tool = ? AND key = ? AND state IN ('pending','committed')
+      const existing = this.store.db.prepare(`
+        SELECT operation_id, state, created_at, external_reference, fail_reason FROM operations
+         WHERE tool = ? AND key = ? AND state IN ('pending','committed','failed','uncertain')
          ORDER BY created_at DESC LIMIT 1
-      `).get(params.tool, params.key) as { operation_id: string; state: OpState; created_at: number } | undefined;
-      if (!existing) {
-        // Not a dup — some other error. Bubble up.
-        throw e;
-      }
-      const retry_after_ms = Math.max(0, (existing.created_at + ttl_ms) - now);
+      `).get(params.tool, params.key) as
+        { operation_id: string; state: OpState; created_at: number; external_reference: string | null; fail_reason: string | null } | undefined;
+      if (!existing) throw e;   // not a dup — real error
       return {
         fresh: false,
         operation_id: existing.operation_id,
         state: existing.state,
         key: params.key,
         created_at: existing.created_at,
-        retry_after_ms,
+        retry_after_ms: Math.max(0, (existing.created_at + ttl_ms) - now),
+        external_reference: existing.external_reference,
+        guidance: guidanceFor(existing.state, existing.external_reference, existing.fail_reason),
       };
     }
   }
 
   commit(operation_id: string, result_hash: string | null = null): void {
-    const info = this.db.prepare(`
-      UPDATE operations SET state='committed', result_hash=?, updated_at=?
-       WHERE operation_id=? AND state='pending'
-    `).run(result_hash, Date.now(), operation_id);
-    if (info.changes === 0) {
-      throw new Error(`commit refused: operation ${operation_id} not in pending state`);
-    }
+    this.requireTransition(operation_id, ["pending"], `
+      UPDATE operations SET state='committed', result_hash=?, updated_at=? WHERE operation_id=? AND state='pending'
+    `, [result_hash, Date.now(), operation_id], "commit");
   }
 
+  /** PROVEN no side effect (e.g. policy rejected before any provider call).
+   *  Frees the key. */
   rollback(operation_id: string, reason: string): void {
-    const info = this.db.prepare(`
-      UPDATE operations SET state='rolled_back', fail_reason=?, updated_at=?
-       WHERE operation_id=? AND state='pending'
-    `).run(reason, Date.now(), operation_id);
-    if (info.changes === 0) {
-      throw new Error(`rollback refused: operation ${operation_id} not in pending state`);
-    }
+    this.requireTransition(operation_id, ["pending"], `
+      UPDATE operations SET state='rolled_back', fail_reason=?, updated_at=? WHERE operation_id=? AND state='pending'
+    `, [reason, Date.now(), operation_id], "rollback");
   }
 
+  /** Failed with possible side effects. KEEPS the key consumed. */
   fail(operation_id: string, reason: string): void {
-    const info = this.db.prepare(`
-      UPDATE operations SET state='failed', fail_reason=?, updated_at=?
+    this.requireTransition(operation_id, ["pending"], `
+      UPDATE operations SET state='failed', fail_reason=?, updated_at=? WHERE operation_id=? AND state='pending'
+    `, [reason, Date.now(), operation_id], "fail");
+  }
+
+  /**
+   * Gate #2: the response was lost / the call timed out. We do NOT know
+   * whether the provider acted. The key stays consumed so a retry cannot
+   * create a second rental. Caller must later query the provider using
+   * external_reference and then call reconcile().
+   */
+  markUncertain(operation_id: string, reason: string, external_reference?: string): void {
+    this.requireTransition(operation_id, ["pending"], `
+      UPDATE operations SET state='uncertain', fail_reason=?, updated_at=?,
+        external_reference=COALESCE(?, external_reference)
        WHERE operation_id=? AND state='pending'
-    `).run(reason, Date.now(), operation_id);
-    if (info.changes === 0) {
-      throw new Error(`fail refused: operation ${operation_id} not in pending state`);
+    `, [reason, Date.now(), external_reference ?? null, operation_id], "markUncertain");
+  }
+
+  /**
+   * Explicit resolution of a failed/uncertain operation. Only this frees
+   * the key. `resolution` records what was actually true.
+   */
+  reconcile(operation_id: string, resolution: {
+    outcome: "no_side_effect" | "side_effect_confirmed" | "resolved_by_owner";
+    note: string;
+  }): OperationRow {
+    const row = this.get(operation_id);
+    if (!row) throw new Error(`reconcile refused: unknown operation ${operation_id}`);
+    if (!["failed", "uncertain"].includes(row.state)) {
+      throw new Error(`reconcile refused: operation ${operation_id} is ${row.state}, expected failed|uncertain`);
     }
+    const now = Date.now();
+    this.store.db.prepare(`
+      UPDATE operations SET state='reconciled', reconciled_at=?, reconcile_note=?, updated_at=?
+       WHERE operation_id=?
+    `).run(now, `${resolution.outcome}: ${resolution.note}`, now, operation_id);
+    return this.get(operation_id)!;
   }
 
   get(operation_id: string): OperationRow | undefined {
-    return this.db.prepare(`SELECT * FROM operations WHERE operation_id = ?`).get(operation_id) as OperationRow | undefined;
+    return this.store.db.prepare(`SELECT * FROM operations WHERE operation_id = ?`)
+      .get(operation_id) as OperationRow | undefined;
   }
 
-  /** Return all operations currently in `pending` state older than ageMs. */
+  /** Find an op by the reference we handed the provider — the lookup used
+   *  when reconciling a lost response. */
+  findByExternalReference(external_reference: string): OperationRow | undefined {
+    return this.store.db.prepare(`SELECT * FROM operations WHERE external_reference = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(external_reference) as OperationRow | undefined;
+  }
+
   stalePending(age_ms: number): OperationRow[] {
-    return this.db.prepare(`
-      SELECT * FROM operations
-       WHERE state='pending' AND updated_at < ?
-       ORDER BY updated_at ASC
+    return this.store.db.prepare(`
+      SELECT * FROM operations WHERE state='pending' AND updated_at < ? ORDER BY updated_at ASC
     `).all(Date.now() - age_ms) as OperationRow[];
   }
 
-  close(): void {
-    this.db.close();
+  /** Operations awaiting human/provider reconciliation. Operational queue. */
+  awaitingReconciliation(): OperationRow[] {
+    return this.store.db.prepare(`
+      SELECT * FROM operations WHERE state IN ('failed','uncertain') ORDER BY updated_at ASC
+    `).all() as OperationRow[];
+  }
+
+  private requireTransition(
+    operation_id: string, from: OpState[], sql: string, args: unknown[], label: string,
+  ): void {
+    const info = this.store.db.prepare(sql).run(...(args as never[]));
+    if (info.changes === 0) {
+      const row = this.get(operation_id);
+      throw new Error(`${label} refused: operation ${operation_id} is ${row ? row.state : "missing"}, expected ${from.join("|")}`);
+    }
+  }
+}
+
+function guidanceFor(state: OpState, extref: string | null, failReason: string | null): string {
+  switch (state) {
+    case "pending":
+      return "An identical operation is already in flight. Wait for it to settle; do not retry.";
+    case "committed":
+      return "This operation already succeeded. Retrying would duplicate the charge.";
+    case "failed":
+      return `Previous attempt failed with possible side effects (${failReason ?? "unknown"}). ` +
+             `Query the provider${extref ? ` using external_reference=${extref}` : ""} to confirm, then call reconcile().`;
+    case "uncertain":
+      return `Previous attempt's outcome is UNKNOWN (${failReason ?? "lost response"}). ` +
+             `A retry could create a duplicate rental. Query the provider${extref ? ` using external_reference=${extref}` : ""} first, then call reconcile().`;
+    default:
+      return "Key is free; this should not have blocked.";
   }
 }

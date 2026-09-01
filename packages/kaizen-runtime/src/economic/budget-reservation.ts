@@ -24,10 +24,8 @@
 //  verify with the provider, then either commit or release).
 // ═══════════════════════════════════════════════════════════════════════
 
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
+import type { EconomicStore } from "./store.js";
 import {
   PolicyEngine,
   type EconomicActionRequest,
@@ -68,33 +66,13 @@ export interface BudgetReservationConfig {
 }
 
 export class BudgetReservation {
-  private readonly db: Database.Database;
+  private readonly db: import("better-sqlite3").Database;
   private readonly policy: PolicyEngine;
   private readonly windowMs: number;
 
-  constructor(cfg: BudgetReservationConfig = {}) {
-    const stateDir = cfg.stateDir || path.join(process.cwd(), "data");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = cfg.dbPath || path.join(stateDir, "budget.db");
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS reservations (
-        reservation_id   TEXT PRIMARY KEY,
-        decision_id      TEXT NOT NULL,
-        agent_id         TEXT NOT NULL,
-        kind             TEXT NOT NULL,
-        amount_usd       REAL NOT NULL,
-        actual_cost_usd  REAL,
-        state            TEXT NOT NULL CHECK(state IN ('held','committed','released')),
-        created_at       INTEGER NOT NULL,
-        updated_at       INTEGER NOT NULL,
-        release_reason   TEXT
-      );
-      CREATE INDEX IF NOT EXISTS reservations_agent_state ON reservations(agent_id, state);
-      CREATE INDEX IF NOT EXISTS reservations_created ON reservations(created_at);
-      CREATE INDEX IF NOT EXISTS reservations_decision ON reservations(decision_id);
-    `);
+  /** Gate #6: shares ONE database with the ledger + idempotency store. */
+  constructor(store: EconomicStore, cfg: { policy?: PolicyEngine; windowMs?: number } = {}) {
+    this.db = store.db;
     this.policy = cfg.policy || new PolicyEngine();
     this.windowMs = cfg.windowMs ?? 24 * 3600 * 1000;
   }
@@ -119,28 +97,43 @@ export class BudgetReservation {
   }): ReserveResult {
     // `immediate` takes the write lock at BEGIN, not at first write — this
     // is what makes the read-then-write sequence race-free.
-    const txn = this.db.transaction((p: typeof params): ReserveResult => {
-      const totals = this.totalsFor(p.agent_id);
-      const snap: PolicySnapshot = {
-        spent_last_24h_usd: totals.committed_usd,
-        reserved_usd: totals.held_usd,
-        wallet_balance_usd: p.walletBalanceUsd,
-      };
-      const decision = this.policy.evaluate(
-        { ...p.request, concurrent_gpus: p.concurrent_gpus ?? this.activeGpuCount(p.agent_id) },
-        snap,
-      );
-      if (!decision.allow) return { ok: false, policy: decision };
-
-      const reservation_id = randomUUID();
-      const now = Date.now();
-      this.db.prepare(`
-        INSERT INTO reservations (reservation_id, decision_id, agent_id, kind, amount_usd, state, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'held', ?, ?)
-      `).run(reservation_id, p.decision_id, p.agent_id, p.request.kind, p.request.amount_usd, now, now);
-      return { ok: true, reservation_id, policy: decision };
-    });
+    const txn = this.db.transaction((p: typeof params): ReserveResult => this.reserveWithin(p));
     return txn.immediate(params);
+  }
+
+  /**
+   * Same logic as reserve() but WITHOUT opening its own transaction.
+   * Gate #6: the DecisionBuilder already holds an IMMEDIATE transaction on
+   * the shared store, and SQLite does not support nesting one inside it.
+   * Callers outside a transaction should use reserve(); callers already
+   * inside store.atomic() must use this.
+   */
+  reserveWithin(params: {
+    decision_id: string;
+    agent_id: string;
+    request: EconomicActionRequest;
+    walletBalanceUsd: number;
+    concurrent_gpus?: number;
+  }): ReserveResult {
+    const totals = this.totalsFor(params.agent_id);
+    const snap: PolicySnapshot = {
+      spent_last_24h_usd: totals.committed_usd,
+      reserved_usd: totals.held_usd,
+      wallet_balance_usd: params.walletBalanceUsd,
+    };
+    const decision = this.policy.evaluate(
+      { ...params.request, concurrent_gpus: params.concurrent_gpus ?? this.activeGpuCount(params.agent_id) },
+      snap,
+    );
+    if (!decision.allow) return { ok: false, policy: decision };
+
+    const reservation_id = randomUUID();
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO reservations (reservation_id, decision_id, agent_id, kind, amount_usd, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'held', ?, ?)
+    `).run(reservation_id, params.decision_id, params.agent_id, params.request.kind, params.request.amount_usd, now, now);
+    return { ok: true, reservation_id, policy: decision };
   }
 
   /** Phase 2 — the money actually moved. Record what it really cost. */
@@ -218,5 +211,4 @@ export class BudgetReservation {
     `).all(Date.now() - age_ms) as ReservationRow[];
   }
 
-  close(): void { this.db.close(); }
 }

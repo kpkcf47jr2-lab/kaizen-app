@@ -3,10 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EconomicEventLedger, LEGAL_TRANSITIONS } from "../../economic/event-ledger.js";
+import { EconomicStore } from "../../economic/store.js";
 
 function freshLedger(): EconomicEventLedger {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kz-ledger-"));
-  return new EconomicEventLedger({ stateDir: dir });
+  return new EconomicEventLedger(new EconomicStore({ stateDir: dir }));
 }
 
 function baseDecision(over: Record<string, unknown> = {}) {

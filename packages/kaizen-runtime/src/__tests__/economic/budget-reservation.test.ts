@@ -3,11 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { BudgetReservation } from "../../economic/budget-reservation.js";
-import { PolicyEngine, HARD_LIMITS } from "../../economic/policy-engine.js";
+import { PolicyEngine, POLICY_PROFILES } from "../../economic/policy-engine.js";
+import { EconomicStore } from "../../economic/store.js";
+
+const HARD_LIMITS = POLICY_PROFILES.PHASE1_INITIAL_TEST;
 
 function fresh(killed = false): BudgetReservation {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kz-budget-"));
-  return new BudgetReservation({ stateDir: dir, policy: new PolicyEngine(() => killed) });
+  return new BudgetReservation(new EconomicStore({ stateDir: dir }), {
+    policy: new PolicyEngine(() => killed, "PHASE1_INITIAL_TEST"),
+  });
 }
 
 const AGENT = "kaizen-fusion";

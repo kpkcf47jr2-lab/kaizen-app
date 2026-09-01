@@ -3,10 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { IdempotencyStore, makeIdempotencyKey, canonicalizeArgs, newOperationId } from "../../economic/idempotency-store.js";
+import { EconomicStore } from "../../economic/store.js";
 
-function freshStore(): { store: IdempotencyStore; dir: string } {
+function freshStore(): { store: IdempotencyStore; dir: string; economic: EconomicStore } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kz-idem-"));
-  return { store: new IdempotencyStore({ stateDir: dir }), dir };
+  const economic = new EconomicStore({ stateDir: dir });
+  return { store: new IdempotencyStore(economic), dir, economic };
 }
 
 describe("canonicalizeArgs", () => {
@@ -92,34 +94,37 @@ describe("IdempotencyStore", () => {
     expect(r2.operation_id).not.toBe(r1.operation_id);
   });
 
-  it("fail() marks failed but blocks retry until manual expire (design choice: preserve billing evidence)", () => {
+  it("GATE #2 — fail() KEEPS the key consumed until explicit reconcile()", () => {
     const r1 = store.begin({ tool: "compute.rent", key: "k5", actor: "kaizen" });
-    store.fail(r1.operation_id, "payment failed after provider succeeded");
-    const row = store.get(r1.operation_id)!;
-    expect(row.state).toBe("failed");
-    // failed does NOT block the unique index (per WHERE clause) — same key can be tried again.
-    // This is intentional: `fail` is "we don't know outcome; do not retry silently". A retry
-    // must be a NEW deliberate call, which will get a new operation_id.
+    store.fail(r1.operation_id, "payment succeeded but provisioning failed");
+    expect(store.get(r1.operation_id)!.state).toBe("failed");
+    // A retry MUST be refused — we do not know whether a rental exists.
     const r2 = store.begin({ tool: "compute.rent", key: "k5", actor: "kaizen" });
-    expect(r2.fresh).toBe(true);
+    expect(r2.fresh).toBe(false);
+    expect(r2.state).toBe("failed");
+    expect(r2.guidance).toMatch(/reconcile/i);
+    // Only reconcile() frees it.
+    store.reconcile(r1.operation_id, { outcome: "no_side_effect", note: "provider confirmed no instance" });
+    const r3 = store.begin({ tool: "compute.rent", key: "k5", actor: "kaizen" });
+    expect(r3.fresh).toBe(true);
   });
 
   it("commit on non-pending row throws", () => {
     const r1 = store.begin({ tool: "compute.rent", key: "k6", actor: "kaizen" });
     store.commit(r1.operation_id);
-    expect(() => store.commit(r1.operation_id)).toThrow(/not in pending/);
+    expect(() => store.commit(r1.operation_id)).toThrow(/expected pending/);
   });
 
   it("rollback on non-pending throws", () => {
     const r1 = store.begin({ tool: "compute.rent", key: "k7", actor: "kaizen" });
     store.commit(r1.operation_id);
-    expect(() => store.rollback(r1.operation_id, "too late")).toThrow(/not in pending/);
+    expect(() => store.rollback(r1.operation_id, "too late")).toThrow(/expected pending/);
   });
 
   it("stalePending returns pending ops older than N ms", async () => {
     const r1 = store.begin({ tool: "compute.rent", key: "k8", actor: "kaizen" });
     // Simulate age by directly mutating updated_at (not committed).
-    (store as unknown as { db: import("better-sqlite3").Database }).db
+    (store as unknown as { store: { db: import("better-sqlite3").Database } }).store.db
       .prepare("UPDATE operations SET updated_at = ? WHERE operation_id = ?")
       .run(Date.now() - 10_000, r1.operation_id);
     const stale = store.stalePending(5_000);

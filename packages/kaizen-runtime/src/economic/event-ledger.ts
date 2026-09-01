@@ -25,10 +25,8 @@
 //  transition, immutable).
 // ═══════════════════════════════════════════════════════════════════════
 
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
+import type { EconomicStore } from "./store.js";
 
 // ── State machine ─────────────────────────────────────────────────────
 
@@ -76,7 +74,9 @@ export const LEGAL_TRANSITIONS: Record<DecisionState, DecisionState[]> = {
   // Error states are terminal-ish; some allow escalation
   POLICY_REJECTED:     [],
   PROVIDER_FAILED:     ["CLOSED", "BILLING_DISPUTE"],
-  PROVISION_TIMEOUT:   ["STOP_REQUESTED", "CLOSED"],
+  // A provisioning timeout with an unconfirmed charge is exactly the case
+  // that must become a billing dispute rather than a silent close.
+  PROVISION_TIMEOUT:   ["STOP_REQUESTED", "CLOSED", "BILLING_DISPUTE"],
   WORKLOAD_FAILED:     ["STOP_REQUESTED"],
   STOP_FAILED:         ["STOP_REQUESTED", "BILLING_DISPUTE"],       // retry allowed
   BILLING_DISPUTE:     ["CLOSED"],
@@ -124,54 +124,12 @@ export interface DecisionEvent {
 // ── The ledger ────────────────────────────────────────────────────────
 
 export class EconomicEventLedger {
-  private readonly db: Database.Database;
+  private readonly db: import("better-sqlite3").Database;
 
-  constructor(cfg: { dbPath?: string; stateDir?: string } = {}) {
-    const stateDir = cfg.stateDir || path.join(process.cwd(), "data");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = cfg.dbPath || path.join(stateDir, "economic-ledger.db");
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS decisions (
-        decision_id            TEXT PRIMARY KEY,
-        agent_id               TEXT NOT NULL,
-        objective              TEXT NOT NULL,
-        available_capital_usd  REAL NOT NULL,
-        reserved_capital_usd   REAL NOT NULL DEFAULT 0,
-        options_considered     TEXT NOT NULL,   -- json
-        selected_option        TEXT,            -- json
-        reason                 TEXT NOT NULL,
-        confidence             REAL NOT NULL,
-        expected_cost_usd      REAL NOT NULL,
-        maximum_cost_usd       REAL NOT NULL,
-        expected_value_usd     REAL NOT NULL,
-        policy_result          TEXT,            -- json
-        tool_calls             TEXT NOT NULL DEFAULT '[]',
-        provider               TEXT,
-        actual_cost_usd        REAL,
-        actual_result          TEXT,            -- json
-        profit_or_utility_usd  REAL,
-        failure_reason         TEXT,
-        state                  TEXT NOT NULL,
-        created_at             INTEGER NOT NULL,
-        updated_at             INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS decisions_state_created ON decisions(state, created_at);
-      CREATE INDEX IF NOT EXISTS decisions_agent_state ON decisions(agent_id, state);
-
-      CREATE TABLE IF NOT EXISTS decision_events (
-        event_id     TEXT PRIMARY KEY,
-        decision_id  TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,
-        from_state   TEXT,
-        to_state     TEXT NOT NULL,
-        ts           INTEGER NOT NULL,
-        actor        TEXT NOT NULL,
-        data         TEXT NOT NULL DEFAULT '{}'
-      );
-      CREATE INDEX IF NOT EXISTS decision_events_decision_ts ON decision_events(decision_id, ts);
-    `);
+  /** Gate #6: shares ONE database with idempotency + reservations so a
+   *  dedupe + reserve + transition sequence is a single atomic unit. */
+  constructor(private readonly store: EconomicStore) {
+    this.db = store.db;
   }
 
   /** Insert a fresh decision in DECISION_CREATED state. */
@@ -311,5 +269,4 @@ export class EconomicEventLedger {
     return { spent_usd: spent.s, reserved_usd: reserved.r };
   }
 
-  close(): void { this.db.close(); }
 }
