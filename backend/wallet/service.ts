@@ -52,6 +52,14 @@ export const CHAINS: Record<number, ChainConfig> = {
   8453: BASE,
 };
 
+/** Símbolo del token nativo de cada cadena. Estaba escrito como un ternario
+ *  dentro de readBalances; se saca acá porque el valuador de posiciones
+ *  necesita el mismo mapa y dos copias se desincronizan. */
+export const NATIVE_SYMBOL_BY_CHAIN: Record<number, string> = {
+  137: "POL",
+  8453: "ETH",
+};
+
 /** USDC native on Polygon 137. Same address Casino + Predict use. */
 export const USDC_POLYGON = {
   address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
@@ -225,7 +233,7 @@ export class SecureWalletService {
     let sumUsdc = 0;
     let sumNative = 0;
     for (const r of perChain) {
-      const symbol = r.id === 137 ? "POL" : r.id === 8453 ? "ETH" : "?";
+      const symbol = NATIVE_SYMBOL_BY_CHAIN[r.id] ?? "?";
       byChain[r.id] = { usdc: r.usdc, native: r.native, nativeSymbol: symbol };
       sumUsdc += r.usdc;
       sumNative += r.native;

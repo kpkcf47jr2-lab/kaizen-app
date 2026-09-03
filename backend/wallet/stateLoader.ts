@@ -15,7 +15,7 @@ import { MemoryStore } from "../../src/memory/store.js";
 import type { AgentStateLoader } from "./service.js";
 import type { AgentState } from "../../src/policy/engine.js";
 import { PermissionLevel } from "../../src/policy/limits.js";
-import { CHAINS, USDC_BY_CHAIN } from "./service.js";
+import { CHAINS, USDC_BY_CHAIN, NATIVE_SYMBOL_BY_CHAIN } from "./service.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -32,6 +32,23 @@ export class ComposedStateLoader implements AgentStateLoader {
   /** Convert an on-chain native amount to USD using the per-chain rate table. */
   gasUsdFor(chainId: number, nativeAmount: number): number {
     return nativeAmount * (this.nativeUsdRates[chainId] ?? 0);
+  }
+
+  /** Valúa una tenencia por su símbolo de precio (ej. WETH cotiza como ETH).
+   *
+   *  Deriva el precio de la MISMA tabla que el gas en vez de mantener una
+   *  segunda: se busca la cadena cuyo nativo es ese símbolo y se usa su tasa.
+   *  Sin esto haría falta copiar los 3200 de ETH, y una copia se desactualiza
+   *  sola el día que se conecte un feed de precios real.
+   *
+   *  Devuelve 0 para un símbolo desconocido — mejor no contarlo que inventarle
+   *  un precio y que la agente crea que tiene plata que no tiene.
+   */
+  usdForSymbol(priceSymbol: string, amount: number): number {
+    for (const [idStr, rate] of Object.entries(this.nativeUsdRates)) {
+      if (NATIVE_SYMBOL_BY_CHAIN[Number(idStr)] === priceSymbol) return amount * rate;
+    }
+    return 0;
   }
 
   /** Total gas value (USD) across every whitelisted chain for an address. */

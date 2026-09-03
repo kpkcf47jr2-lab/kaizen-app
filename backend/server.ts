@@ -129,6 +129,39 @@ function makeApp() {
   });
   const walletService = new SecureWalletService(vault, stateLoader);
 
+  /** Fuente ÚNICA de la foto patrimonial de un agente.
+   *
+   *  Cuatro rutas necesitaban lo mismo —GET /agents/:id, el heartbeat
+   *  autónomo, POST /:id/run y POST /:id/tick— y cada una tenía su copia
+   *  del cálculo. Se desincronizaron: contar las posiciones entró sólo en
+   *  /tick, así que por el camino autónomo la agente seguía viendo una
+   *  caída falsa (26.4% en vez de 0.5%), se clasificaba DEFENSIVE y se
+   *  ponía el presupuesto en cero. Un solo lugar, un solo resultado.
+   */
+  async function composeFinancials(agentId: string) {
+    const balances = await walletService.readBalances(agentId);
+    let gasUsdTotal = 0;
+    for (const [idStr, per] of Object.entries(balances.byChain)) {
+      gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
+    }
+    // Lo que tiene comprado ES patrimonio. Sin esto cuenta lo gastado como
+    // pérdida y no cuenta el activo recibido, y cuanto más invierte menos
+    // se permite hacer.
+    const positions = (balances.holdings || [])
+      .filter((h) => h.amount > 0)
+      .map((h) => {
+        const markUsd = stateLoader.usdForSymbol(h.priceSymbol, h.amount);
+        return { strategy: "held", asset: h.symbol, entryUsd: markUsd, currentUsd: markUsd };
+      })
+      .filter((p) => p.currentUsd > 0);
+    return {
+      balances,
+      positions,
+      /** Lo que espera snapshot(): el gas ya valuado, con tasa 1. */
+      snapBalances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+    };
+  }
+
   const tools = new ToolRegistry();
   tools.register(makeGetBalanceTool(walletService));
   tools.register(makeTransferTool(walletService));
@@ -345,21 +378,15 @@ function makeApp() {
     try {
       const record = await registry.get(req.params.id);
       if (!record) return res.status(404).json({ error: "not found" });
-      const balances = await walletService.readBalances(req.params.id);
       // Owner-flagged 2026-08-28: snapshot() used to receive a single scalar
       // polUsdRate and multiply every chain's native by it — ETH on Base was
       // being valued as if it were POL, so 0.00081 ETH ($2.60) showed up as
-      // gas=$0.00. Now we compute total gas USD across chains via stateLoader
-      // and pass it as (pol=totalGasUsd, polUsdRate=1) so snapshot arithmetic
-      // stays correct without changing its signature.
-      let gasUsdTotal = 0;
-      for (const [idStr, per] of Object.entries(balances.byChain)) {
-        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-      }
+      // gas=$0.00. composeFinancials() ya entrega el gas valuado por cadena.
+      const { balances, positions, snapBalances } = await composeFinancials(req.params.id);
       const snap = snapshot(
         req.params.id,
-        { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
-        [],
+        snapBalances,
+        positions,
         { outflow24hUsd: 0, outflow7dUsd: 0 },
         record.peakNetWorthUsd,
       );
@@ -426,14 +453,9 @@ function makeApp() {
         snapshotProvider: async () => {
           const record = await registry.get(agentId);
           if (!record) throw new Error(`agent ${agentId} not found`);
-          const balances = await walletService.readBalances(agentId);
-          let gasUsdTotal = 0;
-          for (const [idStr, per] of Object.entries(balances.byChain)) {
-            gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-          }
-          const snap = snapshot(agentId,
-            { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
-            [], { outflow24hUsd: 0, outflow7dUsd: 0 }, record.peakNetWorthUsd);
+          const { positions, snapBalances } = await composeFinancials(agentId);
+          const snap = snapshot(agentId, snapBalances, positions,
+            { outflow24hUsd: 0, outflow7dUsd: 0 }, record.peakNetWorthUsd);
           const children = (await registry.list()).filter((r) => r.parentAgentId === agentId);
           return toRuntimeSnapshot(agentId, snap, children.length);
         },
@@ -657,15 +679,11 @@ function makeApp() {
     try {
       const record = await registry.get(req.params.id);
       if (!record) return res.status(404).json({ error: "not found" });
-      const balances = await walletService.readBalances(req.params.id);
-      let gasUsdTotal = 0;
-      for (const [idStr, per] of Object.entries(balances.byChain)) {
-        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-      }
+      const { positions, snapBalances } = await composeFinancials(req.params.id);
       const snap = snapshot(
         req.params.id,
-        { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
-        [],
+        snapBalances,
+        positions,
         { outflow24hUsd: 0, outflow7dUsd: 0 },
         record.peakNetWorthUsd,
       );
@@ -701,29 +719,13 @@ function makeApp() {
     try {
       const record = await registry.get(req.params.id);
       if (!record) return res.status(404).json({ error: "not found" });
-      const balances = await walletService.readBalances(req.params.id);
       const agentState = await stateLoader.load(req.params.id);
-      // Same fix as GET /agents/:id — compute total gas USD via per-chain
-      // rates instead of applying a single scalar polUsdRate to every native.
-      let gasUsdTotal = 0;
-      for (const [idStr, per] of Object.entries(balances.byChain)) {
-        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-      }
-      // Lo que tiene comprado cuenta como patrimonio. Sin esto la agente
-      // lee cada inversión como pérdida y se paraliza sola.
-      const ethUsd = Number(process.env.KAIZEN_ETH_USD_RATE || 3200);
-      const positions = (balances.holdings || [])
-        .filter((h) => h.amount > 0)
-        .map((h) => {
-          const markUsd = h.priceSymbol === "ETH" ? h.amount * ethUsd : 0;
-          return { strategy: "held", asset: h.symbol, entryUsd: markUsd, currentUsd: markUsd };
-        })
-        .filter((p) => p.currentUsd > 0);
+      const { positions, snapBalances } = await composeFinancials(req.params.id);
 
       const result = await decisionLoop.tick({
         agentId: req.params.id,
         operatorPrompt: req.body?.operatorPrompt,
-        balances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+        balances: snapBalances,
         positions,
         agentState,
       });
@@ -761,12 +763,8 @@ function makeApp() {
         );
         record = await registry.get(walletAgentId);
       }
-      const balances = await walletService.readBalances(walletAgentId);
       const agentState = await stateLoader.load(walletAgentId);
-      let gasUsdTotal = 0;
-      for (const [idStr, per] of Object.entries(balances.byChain)) {
-        gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-      }
+      const { positions, snapBalances } = await composeFinancials(walletAgentId);
       const contextualPrompt = [
         "[CONTEXT: llamado desde la wallet Kairos. Presentate como KairosAgent (powered by Kaizen).",
         "El usuario está usando la wallet — ofrece acciones concretas de wallet (swap, send, receive, exchange, casino, predict, elite).",
@@ -777,7 +775,8 @@ function makeApp() {
       const result = await decisionLoop.tick({
         agentId: walletAgentId,
         operatorPrompt: contextualPrompt,
-        balances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+        balances: snapBalances,
+        positions,
         agentState,
       });
       // Wallet UI expects `content`. Kaizen's tick returns `outcome.reason`
