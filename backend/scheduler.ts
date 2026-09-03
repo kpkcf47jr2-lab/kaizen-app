@@ -20,6 +20,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 import type { AgentRegistry, AgentRecord } from "../src/agent/registry.js";
+import { componerFinancials, type Valuador } from "./wallet/financials.js";
 import type { DecisionLoop } from "../src/brain/decisionLoop.js";
 import type { SecureWalletService } from "./wallet/service.js";
 import type { AgentStateLoader } from "./wallet/service.js";
@@ -174,23 +175,18 @@ export class AutoTickScheduler {
 
   private async tickOne(a: AgentRecord, tickTs: number): Promise<void> {
     try {
-      const balances = await this.wallet.readBalances(a.agentId);
       const agentState = await this.stateLoader.load(a.agentId);
-      // Sum native × per-chain rate. Falls back to legacy polUsdRate if no
-      // map given (single-chain agents from before Base was whitelisted).
-      const rates = this.cfg.nativeUsdRates
-        ?? { 137: this.cfg.polUsdRate ?? 0.5, 8453: 3200 };
-      let gasUsdTotal = 0;
-      for (const [idStr, per] of Object.entries(balances.byChain || {})) {
-        gasUsdTotal += per.native * (rates[Number(idStr)] ?? 0);
-      }
+      // Fuente única compartida con el resto del backend. Antes este camino
+      // —el autónomo— tenía su propia copia del cálculo: no contaba las
+      // posiciones y usaba tasas congeladas al arranque, así que en bucle
+      // la agente se veía $5.59 en vez de $6.55 y se clasificaba DEFENSIVE.
+      const { positions, snapBalances } = await componerFinancials(
+        this.wallet, this.stateLoader as unknown as Valuador, a.agentId,
+      );
       const result = await this.loop.tick({
         agentId: a.agentId,
-        balances: {
-          usdc: balances.usdc,
-          pol: gasUsdTotal,
-          polUsdRate: 1,
-        },
+        balances: snapBalances,
+        positions,
         agentState,
       });
       console.log(

@@ -70,6 +70,7 @@ import { PriceFeed } from "../src/prices/feed.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
+import { componerFinancials } from "./wallet/financials.js";
 import { AutoTickScheduler } from "./scheduler.js";
 import { appendEntry, count as waitlistCount, isValidEmail, loadEmails } from "./waitlist.js";
 // Fase 1 multi-turn ReAct runtime — new endpoint POST /agents/:id/run
@@ -149,38 +150,11 @@ async function makeApp() {
 
   const walletService = new SecureWalletService(vault, stateLoader);
 
-  /** Fuente ÚNICA de la foto patrimonial de un agente.
-   *
-   *  Cuatro rutas necesitaban lo mismo —GET /agents/:id, el heartbeat
-   *  autónomo, POST /:id/run y POST /:id/tick— y cada una tenía su copia
-   *  del cálculo. Se desincronizaron: contar las posiciones entró sólo en
-   *  /tick, así que por el camino autónomo la agente seguía viendo una
-   *  caída falsa (26.4% en vez de 0.5%), se clasificaba DEFENSIVE y se
-   *  ponía el presupuesto en cero. Un solo lugar, un solo resultado.
-   */
-  async function composeFinancials(agentId: string) {
-    const balances = await walletService.readBalances(agentId);
-    let gasUsdTotal = 0;
-    for (const [idStr, per] of Object.entries(balances.byChain)) {
-      gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
-    }
-    // Lo que tiene comprado ES patrimonio. Sin esto cuenta lo gastado como
-    // pérdida y no cuenta el activo recibido, y cuanto más invierte menos
-    // se permite hacer.
-    const positions = (balances.holdings || [])
-      .filter((h) => h.amount > 0)
-      .map((h) => {
-        const markUsd = stateLoader.usdForSymbol(h.priceSymbol, h.amount);
-        return { strategy: "held", asset: h.symbol, entryUsd: markUsd, currentUsd: markUsd };
-      })
-      .filter((p) => p.currentUsd > 0);
-    return {
-      balances,
-      positions,
-      /** Lo que espera snapshot(): el gas ya valuado, con tasa 1. */
-      snapBalances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
-    };
-  }
+  /** Delegado al módulo compartido: es la MISMA función que usa el
+   *  AutoTickScheduler. Tenerla duplicada acá fue justo el origen del bug —
+   *  se arregló en las rutas HTTP y no en el bucle autónomo. */
+  const composeFinancials = (agentId: string) =>
+    componerFinancials(walletService, stateLoader, agentId);
 
   const tools = new ToolRegistry();
   tools.register(makeGetBalanceTool(walletService));
