@@ -111,6 +111,36 @@ class DetectorDeVueltas {
   }
 }
 
+/** ¿La herramienta respondió OK pero sin contenido útil?
+ *
+ *  Devuelve una descripción corta del vacío, o null si trajo algo. Se mira
+ *  sólo el primer nivel y sólo arrays: es deliberadamente conservador,
+ *  porque marcar como inútil algo que sí sirvió sería peor que no marcarlo
+ *  — quedaría en su memoria diciéndole que no use una herramienta buena.
+ */
+function resultadoVacio(result: unknown): string | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  if (r.ok === false) return null;           // ya se registra como fallo
+
+  // Se separa la CARGA de los METADATOS. El caso real observado fue
+  // {ok:true, scanned:["amazon-affiliate"], products:[]}: `scanned` dice qué
+  // fuentes se miraron, no qué se encontró. Contarla como contenido daba el
+  // vacío por bueno y la lección nunca se escribía.
+  //
+  // Regla: una colección de objetos (o vacía, que no se puede saber) es
+  // carga; una de textos o números es etiqueta.
+  const carga = Object.entries(r).filter(([, v]) =>
+    Array.isArray(v) && (v.length === 0 || typeof v[0] === "object"),
+  );
+  if (carga.length === 0) return null;       // sin colecciones, no opinamos
+  if (carga.some(([, v]) => (v as unknown[]).length > 0)) return null;
+  return carga.map(([k]) => `${k}: 0`).join(", ");
+}
+
+/** Sólo para tests. */
+export const resultadoVacioParaTest = resultadoVacio;
+
 /** Modo hambre: le pone precio a existir.
  *
  *  Sin esto, esperar sale gratis y por lo tanto siempre gana — la opción
@@ -402,6 +432,22 @@ export class DecisionLoop {
           });
         } else if (o.kind === "tool_call") {
           usadas.set(o.tool, (usadas.get(o.tool) ?? 0) + 1);
+          // Una herramienta puede "funcionar" y no servir de nada.
+          // commerce.discoverProducts devuelve {ok:true, products:[]} sin la
+          // API de Amazon: para el sistema es un éxito, para ella es una
+          // pared. Sin registrarlo, la reintenta en cada ciclo — se observó
+          // el 2026-09-03 pidiéndola tres veces seguidas.
+          const vacio = resultadoVacio(o.result);
+          if (vacio) {
+            mem.aprender({
+              scope: "herramienta",
+              clave: `vacia:${o.tool}`,
+              leccion: `${o.tool} responde bien pero viene VACÍA (${vacio}). ` +
+                       `No insistas con ella: buscá el dato por otro lado.`,
+              evidencia: vacio,
+              util: false,
+            });
+          }
         }
       }
 

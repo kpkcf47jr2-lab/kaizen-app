@@ -125,3 +125,56 @@ describe("el reloj del hambre lo hace real, no relato", () => {
     expect(t).toContain("consumidos $0.2500");
   });
 });
+
+// Una herramienta puede "funcionar" y no servir. commerce.discoverProducts
+// devuelve {ok:true, products:[]} sin API de Amazon: éxito para el sistema,
+// pared para ella. Observado el 2026-09-03 pidiéndola tres veces seguidas.
+describe("detectar herramientas que responden vacías", () => {
+  let vacio: (r: unknown) => string | null;
+  beforeEach(async () => {
+    ({ resultadoVacioParaTest: vacio } = await import("../decisionLoop.js"));
+  });
+
+  it("marca el caso real: ok:true con lista vacía", () => {
+    expect(vacio({ ok: true, scanned: ["amazon"], products: [] })).toContain("products: 0");
+  });
+
+  it("NO marca cuando trajo resultados", () => {
+    expect(vacio({ ok: true, products: [{ id: 1 }] })).toBeNull();
+  });
+
+  it("NO marca si alguna colección trae algo, aunque otra esté vacía", () => {
+    expect(vacio({ ok: true, products: [], results: [{ a: 1 }] })).toBeNull();
+  });
+
+  it("no opina de resultados sin colecciones — un swap devuelve un hash, no una lista", () => {
+    expect(vacio({ ok: true, txHash: "0xabc" })).toBeNull();
+  });
+
+  it("deja los fallos al otro camino, que ya los registra", () => {
+    expect(vacio({ ok: false, results: [] })).toBeNull();
+  });
+
+  it("no rompe con basura", () => {
+    for (const x of [null, undefined, 42, "texto", []]) {
+      expect(() => vacio(x)).not.toThrow();
+    }
+  });
+});
+
+describe("carga útil vs metadato", () => {
+  let vacio: (r: unknown) => string | null;
+  beforeEach(async () => {
+    ({ resultadoVacioParaTest: vacio } = await import("../decisionLoop.js"));
+  });
+
+  it("una lista de textos es metadato, no contenido — el caso que falló", () => {
+    // Respuesta REAL de commerce.discoverProducts sin API de Amazon.
+    expect(vacio({ ok: true, scanned: ["amazon-affiliate"], products: [] }))
+      .toContain("products: 0");
+  });
+
+  it("no confunde un scan que sí trajo oportunidades", () => {
+    expect(vacio({ ok: true, scanned: ["predict"], opportunities: [{ id: 1 }] })).toBeNull();
+  });
+});
