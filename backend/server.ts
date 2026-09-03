@@ -66,6 +66,7 @@ import { LightningComputeProvider } from "../src/compute/lightning.js";
 import { NvidiaBrevProvider } from "../src/compute/nvidia-brev.js";
 import { MultiComputeProvider } from "../src/compute/multi.js";
 import { SpheronComputeProvider } from "../src/compute/spheron.js";
+import { PriceFeed } from "../src/prices/feed.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -118,7 +119,7 @@ function requirePassphrase(): string {
   return p;
 }
 
-function makeApp() {
+async function makeApp() {
   const passphrase = requirePassphrase();
 
   const registry = new FileAgentRegistry();
@@ -127,6 +128,25 @@ function makeApp() {
     137: POL_USD_RATE,
     8453: Number(process.env.KAIZEN_ETH_USD_RATE || 3200),
   });
+  // Precios reales. Sin esto ETH quedaba clavado en $3200 mientras valía
+  // $2494 — el patrimonio se reportaba 28% inflado y la Policy Engine
+  // decidía con ese número. Ante un fallo de la fuente se conservan las
+  // últimas tasas buenas; nunca se valúa en cero.
+  const priceFeed = new PriceFeed({
+    fallback: {
+      137: POL_USD_RATE,
+      8453: Number(process.env.KAIZEN_ETH_USD_RATE || 3200),
+    },
+  });
+  const refrescarPrecios = async () => {
+    const r = await priceFeed.refresh();
+    if (r.ok) stateLoader.updateRates(r.rates);
+    else console.warn(`[precios] no se pudo actualizar (${r.reason}); sigo con las últimas buenas`);
+  };
+  await refrescarPrecios();
+  setInterval(() => { void refrescarPrecios(); }, 5 * 60_000).unref();
+  console.log(`[precios] ETH=$${stateLoader.currentRates()[8453]?.toFixed(2)} POL=$${stateLoader.currentRates()[137]?.toFixed(4)}`);
+
   const walletService = new SecureWalletService(vault, stateLoader);
 
   /** Fuente ÚNICA de la foto patrimonial de un agente.
@@ -799,8 +819,8 @@ function makeApp() {
   return { app, scheduler };
 }
 
-function main(): void {
-  const { app, scheduler } = makeApp();
+async function main(): Promise<void> {
+  const { app, scheduler } = await makeApp();
   const server = app.listen(PORT, HOST, () => {
     console.log(`Kaizen backend listening on http://${HOST}:${PORT}`);
     console.log(`  → GET  /healthz`);
@@ -824,4 +844,9 @@ function main(): void {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
-main();
+// main() es async desde que el arranque espera el primer precio real.
+// Sin este catch, un fallo de arranque moriría en silencio.
+main().catch((e) => {
+  console.error("[fatal] no se pudo arrancar:", e);
+  process.exit(1);
+});

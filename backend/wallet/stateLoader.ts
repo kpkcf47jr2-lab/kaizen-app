@@ -25,9 +25,29 @@ const MIN_MS = 60 * 1000;
 export class ComposedStateLoader implements AgentStateLoader {
   constructor(
     private readonly registry: AgentRegistry,
-    /** USD rates for native tokens per chainId. MVP: hardcode; later a price feed. */
-    private readonly nativeUsdRates: Record<number, number> = { 137: 0.5, 8453: 3200 },
+    /** USD rates por chainId. Arrancan con estos valores y los pisa el
+     *  PriceFeed vía updateRates(). Ya NO son la verdad final: eran la
+     *  causa de que el patrimonio se reportara 28% inflado. */
+    private nativeUsdRates: Record<number, number> = { 137: 0.5, 8453: 3200 },
   ) {}
+
+  /** Reemplaza las tasas con las del feed de precios.
+   *
+   *  Se ignora cualquier valor no positivo: un 0 valuaría todo en cero y
+   *  dispararía una crisis fantasma que le pondría el presupuesto en cero
+   *  a la agente sin que haya pasado nada.
+   */
+  updateRates(rates: Record<number, number>): void {
+    for (const [id, usd] of Object.entries(rates)) {
+      if (Number.isFinite(usd) && usd > 0) this.nativeUsdRates[Number(id)] = usd;
+    }
+  }
+
+  /** Tasas vigentes — para diagnóstico y para que la UI muestre con qué
+   *  precio se valuó, en vez de que el número parezca salido de la nada. */
+  currentRates(): Record<number, number> {
+    return { ...this.nativeUsdRates };
+  }
 
   /** Convert an on-chain native amount to USD using the per-chain rate table. */
   gasUsdFor(chainId: number, nativeAmount: number): number {
