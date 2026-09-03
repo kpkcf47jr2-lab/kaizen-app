@@ -133,6 +133,12 @@ export class DecisionLoop {
         recentEvents,
         toolNames: this.tools.list().map(t => t.name),
         operatorPrompt: input.operatorPrompt,
+        // Memoria. Antes acá no iba nada: escribía cada turno en la base y
+        // no los leía nunca, así que empezaba de cero en cada tick. Si
+        // gastaba gas descubriendo que una ruta no servía, al rato lo
+        // repetía igual.
+        recentTurns: mem.recentTurns(12),
+        lecciones: mem.lecciones(12),
       });
     } finally { mem.close(); }
 
@@ -208,6 +214,8 @@ export class DecisionLoop {
         }
       }
 
+      this.destilarLecciones(input.agentId, steps.map((s) => s.outcome));
+
       return {
         agentId: input.agentId,
         ts: Date.now(),
@@ -227,6 +235,7 @@ export class DecisionLoop {
     }
 
     const outcome = await this.executeCall(input.agentId, call, input.agentState);
+    this.destilarLecciones(input.agentId, [outcome]);
 
     return {
       agentId: input.agentId,
@@ -279,6 +288,64 @@ export class DecisionLoop {
       const msg = (e as Error).message;
       this.persistToolResult(agentId, call, { error: msg });
       return { kind: "tool_failed", tool: call.function.name, error: msg };
+    }
+  }
+
+  /** Destila lo que acaba de pasar en lecciones reutilizables.
+   *
+   *  Se apoya SÓLO en hechos mecánicos —qué se rechazó, qué falló, qué no
+   *  produjo nada— y no en que el modelo opine sobre sí mismo. Una lección
+   *  inventada es peor que ninguna: se acumula, se repite en cada briefing
+   *  y termina guiando decisiones con una premisa falsa.
+   *
+   *  La clave (scope+clave) es lo que evita duplicar: la segunda vez que
+   *  algo falla no crea otra fila, suma una confirmación y acumula el costo.
+   *  Así "esto falló 4 veces y me costó $1.20" pesa distinto que "esto falló".
+   */
+  private destilarLecciones(agentId: string, resultados: TickOutcome[]): void {
+    if (resultados.length === 0) return;
+    const mem = new MemoryStore(agentId);
+    try {
+      const usadas = new Map<string, number>();
+      for (const o of resultados) {
+        if (o.kind === "tool_rejected") {
+          mem.aprender({
+            scope: "herramienta",
+            clave: `rechazo:${o.tool}:${o.reason.slice(0, 60)}`,
+            leccion: `${o.tool} te fue rechazada: ${o.reason}`,
+            evidencia: o.reason,
+            util: false,
+          });
+        } else if (o.kind === "tool_failed") {
+          mem.aprender({
+            scope: "herramienta",
+            clave: `falla:${o.tool}:${o.error.slice(0, 60)}`,
+            leccion: `${o.tool} falló: ${o.error}`,
+            evidencia: o.error,
+            util: false,
+          });
+        } else if (o.kind === "tool_call") {
+          usadas.set(o.tool, (usadas.get(o.tool) ?? 0) + 1);
+        }
+      }
+
+      // Repetir la MISMA herramienta dentro de un mismo tick casi nunca
+      // aporta: es la señal de que se quedó girando en el lugar.
+      for (const [tool, n] of usadas) {
+        if (n >= 3) {
+          mem.aprender({
+            scope: "tactica",
+            clave: `repeticion:${tool}`,
+            leccion: `Llamaste ${tool} ${n} veces en un mismo ciclo sin avanzar. ` +
+                     `Si la primera respuesta no te sirvió, cambiá de enfoque en vez de repetirla.`,
+            util: false,
+          });
+        }
+      }
+    } catch {
+      // La memoria es un extra: si falla no puede tumbar el tick.
+    } finally {
+      try { mem.close(); } catch { /* ya cerrada */ }
     }
   }
 

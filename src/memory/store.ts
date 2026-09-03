@@ -53,6 +53,24 @@ export interface EconomicEvent {
   metadata?: string | null;     // JSON for extra fields
 }
 
+/** Una conclusión reutilizable que la agente sacó de su propia experiencia.
+ *  `veces` y `costoUsd` acumulan: dicen cuánto respaldo tiene y cuánto costó
+ *  averiguarlo. `util=false` marca lo que resultó ser un callejón sin salida. */
+export interface Leccion {
+  id: number;
+  createdTs: number;
+  updatedTs: number;
+  /** Familia: "ruta" | "herramienta" | "mercado" | "tactica" | libre. */
+  scope: string;
+  /** Identidad estable de la lección — es la clave que evita duplicar. */
+  clave: string;
+  leccion: string;
+  evidencia: string | null;
+  veces: number;
+  costoUsd: number;
+  util: number;
+}
+
 export interface Fact {
   key: string;
   value: string;
@@ -218,7 +236,80 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_opps_seen ON opportunities(seen_ts DESC);
       CREATE INDEX IF NOT EXISTS idx_opps_open
         ON opportunities(acted_on, seen_ts DESC) WHERE acted_on = 0;
+
+      -- Memoria de largo plazo: lo que APRENDIÓ, no lo que hizo.
+      --
+      -- Antes escribía cada turno en conversation_turns y nunca los volvía
+      -- a leer: tenía un diario que no abría. Si perdía 30 centavos de gas
+      -- descubriendo que una ruta no servía, al día siguiente lo repetía
+      -- igual. Sin esto no hay acumulación, y cada sesión es el día de la
+      -- marmota.
+      --
+      -- Una lección es una conclusión reutilizable con evidencia: qué pasó,
+      -- cuántas veces se confirmó, y cuánto costó averiguarlo. El scope la
+      -- clasifica (ruta, herramienta, mercado, táctica) para poder traer
+      -- sólo las relevantes sin inundar el contexto.
+      CREATE TABLE IF NOT EXISTS lessons (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ts  INTEGER NOT NULL,
+        updated_ts  INTEGER NOT NULL,
+        scope       TEXT NOT NULL,
+        clave       TEXT NOT NULL,
+        leccion     TEXT NOT NULL,
+        evidencia   TEXT,
+        veces       INTEGER NOT NULL DEFAULT 1,
+        costo_usd   REAL NOT NULL DEFAULT 0,
+        util        INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(scope, clave)
+      );
+      CREATE INDEX IF NOT EXISTS idx_lecciones_scope
+        ON lessons(scope, updated_ts DESC);
+      CREATE INDEX IF NOT EXISTS idx_lecciones_utiles
+        ON lessons(util, veces DESC, updated_ts DESC);
     `);
+  }
+
+  // ── lecciones (memoria de largo plazo) ────────────────────────────
+
+  /** Guarda una lección. Si ya existía la misma (scope+clave), NO duplica:
+   *  suma una confirmación, acumula el costo y actualiza el texto.
+   *
+   *  Esa acumulación es la que convierte una anécdota en conocimiento —
+   *  "esto falló 4 veces y me costó $1.20" pesa distinto que "esto falló". */
+  aprender(l: {
+    scope: string; clave: string; leccion: string;
+    evidencia?: string | null; costoUsd?: number; util?: boolean;
+  }): void {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO lessons (created_ts, updated_ts, scope, clave, leccion, evidencia, veces, costo_usd, util)
+       VALUES (?,?,?,?,?,?,1,?,?)
+       ON CONFLICT(scope, clave) DO UPDATE SET
+         updated_ts = excluded.updated_ts,
+         leccion    = excluded.leccion,
+         evidencia  = COALESCE(excluded.evidencia, lessons.evidencia),
+         veces      = lessons.veces + 1,
+         costo_usd  = lessons.costo_usd + excluded.costo_usd,
+         util       = excluded.util`,
+    ).run(
+      now, now, l.scope, l.clave, l.leccion,
+      l.evidencia ?? null, l.costoUsd ?? 0, l.util === false ? 0 : 1,
+    );
+  }
+
+  /** Las lecciones más asentadas primero: las que más veces se confirmaron
+   *  y, a igualdad, las más recientes. */
+  lecciones(limit = 12): Leccion[] {
+    return this.db.prepare(
+      `SELECT id, created_ts AS createdTs, updated_ts AS updatedTs, scope, clave,
+              leccion, evidencia, veces, costo_usd AS costoUsd, util
+       FROM lessons ORDER BY veces DESC, updated_ts DESC LIMIT ?`,
+    ).all(limit) as Leccion[];
+  }
+
+  contarLecciones(): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS n FROM lessons").get() as { n: number };
+    return r.n;
   }
 
   // ── conversation turns ────────────────────────────────────────────

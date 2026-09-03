@@ -18,7 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Snapshot, BudgetProposal } from "./economic.js";
-import type { EconomicEvent } from "../memory/store.js";
+import type { EconomicEvent, ConversationTurn, Leccion } from "../memory/store.js";
 import type { AgentRecord } from "../agent/registry.js";
 import type { ChatMessage } from "./llm.js";
 
@@ -55,6 +55,11 @@ export interface BriefingInput {
   recentEvents: EconomicEvent[];
   toolNames: string[];
   operatorPrompt?: string;
+  /** Lo que hizo hace poco. Sin esto arranca en blanco cada vez: escribía
+   *  cada turno en la base y no los volvía a leer nunca. */
+  recentTurns?: ConversationTurn[];
+  /** Lo que APRENDIÓ, destilado y acumulado entre sesiones. */
+  lecciones?: Leccion[];
 }
 
 /**
@@ -108,6 +113,45 @@ function renderBriefing(i: BriefingInput): string {
     }
     lines.push("");
   }
+  // ── Memoria ────────────────────────────────────────────────────────
+  //  Se renderiza como TEXTO del briefing y no como mensajes sueltos a
+  //  propósito: inyectar turnos crudos rompería el emparejamiento
+  //  assistant→tool que exige la API, y un role:"tool" huérfano es un 400.
+  //  Como texto es inofensivo y cumple la misma función.
+  const lecciones = i.lecciones ?? [];
+  if (lecciones.length > 0) {
+    lines.push("## Lo que aprendiste (memoria de largo plazo)");
+    lines.push("  Esto lo sacaste vos de tu propia experiencia. Confiá en ello:");
+    lines.push("  ya lo pagaste una vez, no lo vuelvas a pagar.");
+    for (const l of lecciones) {
+      const respaldo = l.veces > 1 ? ` [confirmado ${l.veces}×]` : "";
+      const costo = l.costoUsd > 0 ? ` [te costó $${l.costoUsd.toFixed(4)}]` : "";
+      const marca = l.util ? "" : " [CALLEJÓN SIN SALIDA — no reintentar]";
+      lines.push(`  · (${l.scope}) ${l.leccion}${respaldo}${costo}${marca}`);
+    }
+    lines.push("");
+  }
+
+  const turnos = i.recentTurns ?? [];
+  if (turnos.length > 0) {
+    lines.push("## Lo que hiciste hace poco (memoria de corto plazo)");
+    for (const t of turnos) {
+      const cuando = new Date(t.ts).toISOString().slice(5, 16).replace("T", " ");
+      if (t.toolCall) {
+        let usadas = "";
+        try {
+          const parsed = JSON.parse(t.toolCall) as Array<{ function?: { name?: string } }>;
+          usadas = parsed.map((c) => c.function?.name).filter(Boolean).join(", ");
+        } catch { usadas = "(herramienta)"; }
+        const res = (t.toolResult ?? "").slice(0, 160);
+        lines.push(`  [${cuando}] usaste ${usadas}${res ? ` → ${res}` : ""}`);
+      } else if (t.content) {
+        lines.push(`  [${cuando}] ${t.role}: ${t.content.slice(0, 160)}`);
+      }
+    }
+    lines.push("");
+  }
+
   lines.push("## Tools available");
   lines.push(`  ${toolNames.join(", ") || "(none)"}`);
   lines.push("");
