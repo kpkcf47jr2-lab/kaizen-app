@@ -91,7 +91,10 @@ export interface SearchArgs {
 }
 export interface SearchResult {
   ok: boolean;
-  provider: "serper" | "mock";
+  /** "sin-configurar" reemplazó a "mock": antes se devolvían resultados
+   *  inventados como si fueran reales. Ahora falta de credencial es un
+   *  fallo explícito, no una ficción con ok:true. */
+  provider: "serper" | "sin-configurar";
   query: string;
   results: Array<{ title: string; link: string; snippet: string; position?: number }>;
   error?: string;
@@ -100,7 +103,7 @@ export interface SearchResult {
 export function makeWebSearchTool(): RegisteredTool<SearchArgs, SearchResult> {
   const exec: ToolFn<SearchArgs, SearchResult> = async (args) => {
     const q = String(args.query ?? "").trim();
-    if (!q) return { ok: false, provider: "mock", query: q, results: [], error: "empty query" };
+    if (!q) return { ok: false, provider: "sin-configurar", query: q, results: [], error: "empty query" };
     const num = Math.max(1, Math.min(20, Number(args.numResults ?? 10)));
     const apiKey = process.env.SERPER_API_KEY;
     if (!apiKey) {
