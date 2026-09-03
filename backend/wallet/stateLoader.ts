@@ -17,6 +17,30 @@ import type { AgentState } from "../../src/policy/engine.js";
 import { PermissionLevel } from "../../src/policy/limits.js";
 import { CHAINS, USDC_BY_CHAIN, NATIVE_SYMBOL_BY_CHAIN } from "./service.js";
 
+/** Techo de permisos que fija el DUEÑO, por encima de lo que la agente
+ *  pueda auto-asignarse.
+ *
+ *  Antes esto era FINANCIAL fijo en el código: no había forma de dejarla
+ *  razonar y navegar sin darle también la capacidad de firmar. Con el techo
+ *  bajo, la Policy Engine rechaza swaps y transferencias pero la agente
+ *  sigue pudiendo buscar, leer y proponer — sirve para ver cómo piensa sin
+ *  arriesgar un centavo.
+ *
+ *  KAIZEN_MAX_LEVEL: 0=solo lectura 1=sin costo 2=micro 3=financiero
+ *                    4=capital 5=extraordinario.  Por defecto 3, como antes.
+ */
+function maxLevelFromEnv(): PermissionLevel {
+  const raw = process.env.KAIZEN_MAX_LEVEL;
+  if (raw === undefined || raw === "") return PermissionLevel.FINANCIAL;
+  const n = Number(raw);
+  // Un valor basura NO puede ampliar permisos: ante la duda, el default.
+  if (!Number.isInteger(n) || n < 0 || n > PermissionLevel.EXTRAORDINARY) {
+    console.warn(`[permisos] KAIZEN_MAX_LEVEL="${raw}" inválido; uso FINANCIAL`);
+    return PermissionLevel.FINANCIAL;
+  }
+  return n as PermissionLevel;
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const HOUR_MS = 60 * 60 * 1000;
@@ -151,7 +175,7 @@ export class ComposedStateLoader implements AgentStateLoader {
         toolCallsLastMinute,
         gpuSpend24hUsd: 0,     // filled once compute.rentGpu tool ships
         adSpend24hUsd: 0,      // filled once social.publishAd tool ships
-        maxAllowedLevel: PermissionLevel.FINANCIAL,
+        maxAllowedLevel: maxLevelFromEnv(),
         selfLimits: {
           // Sensible starting caps — the agent may lower these later.
           maxTxUsd: 100,
