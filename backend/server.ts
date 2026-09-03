@@ -276,6 +276,69 @@ async function makeApp() {
     ],
   }));
 
+  // Panel local. Se sirve DESDE el backend a propósito: una página abierta
+  // como file:// tiene origen null y CORS la rechaza. Servida acá es mismo
+  // origen y funciona sin tocar la config de CORS.
+  app.get("/panel", (_req, res) => {
+    res.type("html").sendFile(path.join(import.meta.dirname, "panel.html"));
+  });
+
+  /** ¿Ganó por mérito propio?
+   *
+   *  El patrimonio en dólares sube y baja con el mercado: si ETH sube 10%
+   *  su cartera vale más sin que ella haya hecho nada, y eso NO es ganar.
+   *  Para aislar su mérito se guardan las CANTIDADES y el precio del momento
+   *  cero, y se valúa la cartera de hoy con el precio de ENTONCES. Cualquier
+   *  diferencia sólo puede venir de algo que ella hizo.
+   */
+  app.get("/agents/:id/ganancia", async (req, res) => {
+    try {
+      const archivo = path.join(
+        process.env.KAIZEN_STATE_DIR || path.join(process.cwd(), "data"),
+        `baseline-${req.params.id}.json`,
+      );
+      if (!fs.existsSync(archivo)) return res.json({ hayBase: false });
+      const base = JSON.parse(fs.readFileSync(archivo, "utf-8")) as {
+        usdc: number; weth: number; eth: number; precio_eth: number;
+      };
+      const { balances } = await composeFinancials(req.params.id);
+      const weth = (balances.holdings || [])
+        .filter((h) => h.symbol === "WETH")
+        .reduce((s, h) => s + h.amount, 0);
+
+      const P = base.precio_eth;                                  // precio CONGELADO
+      const val = (u: number, w: number, e: number) => u + w * P + e * P;
+      const antes = val(base.usdc, base.weth, base.eth);
+      const ahora = val(balances.usdc, weth, balances.native);
+      const delta = ahora - antes;
+
+      const linea = (etq: string, a: number, b: number, dec: number) => ({
+        etq,
+        antes: a.toFixed(dec),
+        ahora: b.toFixed(dec),
+        delta: (b - a >= 0 ? "+" : "−") + Math.abs(b - a).toFixed(dec),
+      });
+
+      res.json({
+        hayBase: true,
+        precioFijo: P,
+        antes, ahora, delta,
+        lineas: [
+          linea("USDC", base.usdc, balances.usdc, 4),
+          linea("WETH", base.weth, weth, 8),
+          linea("ETH (gas)", base.eth, balances.native, 8),
+        ],
+        veredicto:
+          delta >= 0.5  ? `Ganó $${delta.toFixed(2)} por mérito propio. Superó los 50 centavos.`
+        : delta > 0.005 ? `Ganó $${delta.toFixed(4)}. Positivo, pero todavía no llega a 50 centavos.`
+        : delta > -0.005 ? `Plana: no ganó ni perdió.`
+        :                  `Perdió $${Math.abs(delta).toFixed(4)} — gas y deslizamiento sin ganancia que los cubra.`,
+      });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
   // Trust the proxy header when behind Cloudflare Tunnel so req.ip is real.
   app.set("trust proxy", true);
 
@@ -411,7 +474,9 @@ async function makeApp() {
         record.peakNetWorthUsd,
       );
       const budget = proposeBudget(snap.netWorthUsd, snap.suggestedStatus);
-      res.json({ record, balances, snapshot: snap, budget });
+      // rates: para que el panel muestre CON QUÉ precio se valuó, en vez
+      // de que el patrimonio parezca un número salido de la nada.
+      res.json({ record, balances, snapshot: snap, budget, rates: stateLoader.currentRates() });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }

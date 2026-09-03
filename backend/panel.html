@@ -1,0 +1,196 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kaizen — panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --fondo:#faf9f7; --papel:#fff; --tinta:#1a1a19; --suave:#6b6a67;
+    --linea:#e5e3df; --verde:#1a7f4b; --rojo:#b3261e; --ambar:#8a6d00; --acento:#2f5fd8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo:#16161a; --papel:#1e1e23; --tinta:#eceaе6; --tinta:#ecebe6; --suave:#a3a19c;
+      --linea:#32323a; --verde:#4ade80; --rojo:#f87171; --ambar:#fbbf24; --acento:#7ea2ff;
+    }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--fondo); color:var(--tinta);
+         font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif; }
+  .envoltorio { max-width:760px; margin:0 auto; padding:28px 20px 80px }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.01em }
+  .sub { color:var(--suave); font-size:13px; margin:0 0 24px }
+  .tarjeta { background:var(--papel); border:1px solid var(--linea); border-radius:12px;
+             padding:18px 20px; margin-bottom:16px }
+  .fila { display:flex; justify-content:space-between; align-items:baseline;
+          padding:7px 0; border-bottom:1px solid var(--linea); font-variant-numeric:tabular-nums }
+  .fila:last-child { border-bottom:0 }
+  .fila b { font-weight:600 }
+  .etq { color:var(--suave); font-size:13px }
+  .grande { font-size:26px; font-weight:650; letter-spacing:-.02em }
+  button { font:inherit; font-weight:600; border:0; border-radius:10px; padding:13px 20px;
+           background:var(--acento); color:#fff; cursor:pointer; width:100%; }
+  button:disabled { opacity:.5; cursor:default }
+  button.gris { background:transparent; color:var(--acento); border:1px solid var(--linea); margin-top:8px }
+  .paso { display:flex; gap:10px; padding:8px 0; border-bottom:1px solid var(--linea);
+          font-size:13px; align-items:baseline }
+  .paso:last-child { border-bottom:0 }
+  .n { color:var(--suave); min-width:20px; font-variant-numeric:tabular-nums }
+  .tool { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+          background:var(--fondo); padding:2px 6px; border-radius:5px; border:1px solid var(--linea) }
+  .ok{color:var(--verde)} .mal{color:var(--rojo)} .medio{color:var(--ambar)}
+  .dicho { white-space:pre-wrap; font-size:14px; color:var(--tinta); margin:0 }
+  .oculto { display:none }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--linea);
+          border-top-color:var(--acento); border-radius:50%; animation:g .8s linear infinite;
+          vertical-align:-2px; margin-right:7px }
+  @keyframes g { to { transform:rotate(360deg) } }
+  .aviso { font-size:12.5px; color:var(--suave); margin-top:10px }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; font-size:13px }
+  th { text-align:right; font-weight:600; color:var(--suave); padding:6px 0; font-size:12px }
+  th:first-child { text-align:left }
+  td { text-align:right; padding:6px 0; border-top:1px solid var(--linea) }
+  td:first-child { text-align:left; color:var(--suave) }
+</style>
+
+<div class="envoltorio">
+  <h1>Kaizen</h1>
+  <p class="sub">Panel local · <span id="dir">—</span></p>
+
+  <div class="tarjeta">
+    <div class="fila"><span class="etq">Patrimonio</span><span class="grande" id="pat">—</span></div>
+    <div class="fila"><span class="etq">Efectivo (USDC)</span><b id="cash">—</b></div>
+    <div class="fila"><span class="etq">Invertido (WETH)</span><b id="inv">—</b></div>
+    <div class="fila"><span class="etq">Gas (ETH)</span><b id="gas">—</b></div>
+    <div class="fila"><span class="etq">Caída desde el pico</span><b id="dd">—</b></div>
+    <div class="fila"><span class="etq">Estado</span><b id="est">—</b></div>
+    <p class="aviso" id="precio">—</p>
+  </div>
+
+  <div class="tarjeta">
+    <button id="btn">Soltarla</button>
+    <button class="gris" id="btnRef">Actualizar estado</button>
+    <p class="aviso">Mueve dinero real. Puede tardar varios minutos: encadena hasta 10 pasos
+      y cada uno consulta al modelo. No cierres esta pestaña mientras trabaja.</p>
+  </div>
+
+  <div class="tarjeta oculto" id="cajaPasos">
+    <div class="etq" style="margin-bottom:6px">Lo que hizo</div>
+    <div id="pasos"></div>
+  </div>
+
+  <div class="tarjeta oculto" id="cajaDicho">
+    <div class="etq" style="margin-bottom:8px">Lo que dijo</div>
+    <p class="dicho" id="dicho"></p>
+  </div>
+
+  <div class="tarjeta oculto" id="cajaGan">
+    <div class="etq" style="margin-bottom:8px">¿Ganó por mérito propio?</div>
+    <table id="tablaGan"></table>
+    <p id="veredicto" style="margin:14px 0 0; font-weight:600"></p>
+    <p class="aviso" id="notaGan"></p>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const d2 = (n) => "$" + Number(n).toFixed(2);
+
+async function cargarEstado() {
+  const r = await fetch("/agents/agt_demo");
+  const d = await r.json();
+  const s = d.snapshot, b = d.balances;
+  $("dir").textContent = b.address;
+  $("pat").textContent = d2(s.netWorthUsd);
+  $("cash").textContent = d2(s.cashUsd);
+  $("inv").textContent = d2(s.investedUsd);
+  $("gas").textContent = d2(s.gasReserveUsd);
+  $("dd").textContent = s.drawdownPct.toFixed(1) + "%";
+  $("est").textContent = s.suggestedStatus;
+  if (d.rates) {
+    $("precio").textContent = "Valuado con precios de mercado: ETH $" +
+      Number(d.rates[8453]).toFixed(2) + " · POL $" + Number(d.rates[137]).toFixed(4);
+  }
+  await cargarGanancia();
+}
+
+async function cargarGanancia() {
+  const r = await fetch("/agents/agt_demo/ganancia");
+  if (!r.ok) return;
+  const g = await r.json();
+  if (!g.hayBase) return;
+  $("cajaGan").classList.remove("oculto");
+  $("tablaGan").innerHTML =
+    "<tr><th>&nbsp;</th><th>antes</th><th>ahora</th><th>cambio</th></tr>" +
+    g.lineas.map((l) =>
+      `<tr><td>${l.etq}</td><td>${l.antes}</td><td>${l.ahora}</td><td>${l.delta}</td></tr>`
+    ).join("") +
+    `<tr><td><b>A precio fijo</b></td><td><b>${d2(g.antes)}</b></td>` +
+    `<td><b>${d2(g.ahora)}</b></td><td><b>${g.delta >= 0 ? "+" : "−"}$${Math.abs(g.delta).toFixed(4)}</b></td></tr>`;
+  const v = $("veredicto");
+  v.textContent = g.veredicto;
+  v.className = g.delta >= 0.5 ? "ok" : g.delta > 0.005 ? "medio" : g.delta > -0.005 ? "" : "mal";
+  $("notaGan").textContent = "Todo valuado a ETH $" + g.precioFijo.toFixed(2) +
+    " en ambos momentos, para que el movimiento del mercado no cuente como mérito.";
+}
+
+$("btnRef").onclick = () => cargarEstado();
+
+$("btn").onclick = async () => {
+  const b = $("btn");
+  b.disabled = true;
+  b.innerHTML = '<span class="spin"></span>Trabajando…';
+  $("pasos").innerHTML = ""; $("cajaPasos").classList.add("oculto");
+  $("cajaDicho").classList.add("oculto");
+  try {
+    const r = await fetch("/agents/agt_demo/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operatorPrompt: PROMPT }),
+    });
+    const d = await r.json();
+    const pasos = d.steps || [];
+    $("cajaPasos").classList.remove("oculto");
+    $("pasos").innerHTML = pasos.length
+      ? pasos.map((p, i) => {
+          const k = p.outcome.kind;
+          const cls = k === "tool_call" ? "ok" : k === "tool_rejected" ? "medio" : "mal";
+          const det = p.outcome.reason || p.outcome.error || "";
+          return `<div class="paso"><span class="n">${i + 1}</span>` +
+                 `<span class="tool">${p.tool}</span>` +
+                 `<span class="${cls}">${k}</span>` +
+                 `<span class="etq" style="flex:1">${String(det).slice(0, 90)}</span></div>`;
+        }).join("")
+      : `<div class="paso"><span class="etq">No ejecutó herramientas. ` +
+        `Desenlace: ${d.outcome?.kind} — ${String(d.outcome?.reason || "").slice(0, 200)}</span></div>`;
+    if (d.llmContent) {
+      $("cajaDicho").classList.remove("oculto");
+      $("dicho").textContent = d.llmContent;
+    }
+  } catch (e) {
+    $("cajaPasos").classList.remove("oculto");
+    $("pasos").innerHTML = `<div class="paso"><span class="mal">Falló: ${e.message}</span></div>`;
+  }
+  b.disabled = false;
+  b.textContent = "Soltarla otra vez";
+  await cargarEstado();
+};
+
+const PROMPT = [
+  "LIBERTAD TOTAL. El dueño quiere ver de qué sos capaz sola.",
+  "",
+  "Objetivo: ganar dinero. No importa cuánto — aunque sean cincuenta centavos.",
+  "Lo que importa es que sea GANANCIA TUYA: plata que entró por algo que hiciste,",
+  "no por el precio de lo que ya tenías. El gas no importa, gastá lo que haga falta.",
+  "",
+  "No hay guion: el camino lo elegís vos. Tenés web.search, web.fetch y web.scrape",
+  "para investigar; exchange.quote y exchange.swap para operar; commerce.* para vender;",
+  "sites.deployLanding para publicar. Usá lo que te sirva.",
+  "",
+  "Una sola cosa te pido: antes de gastar, investigá. Buscá una oportunidad concreta",
+  "y verificable en vez de adivinar. Si vas a operar, pedí la cotización antes de ejecutar.",
+  "",
+  "Empezá ahora. Encadená los pasos que necesites.",
+].join("\n");
+
+cargarEstado();
+</script>
