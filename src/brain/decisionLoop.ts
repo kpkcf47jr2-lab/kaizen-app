@@ -25,6 +25,7 @@ import {
 import { snapshot, proposeBudget } from "./economic.js";
 import type { Snapshot, BudgetProposal, Balances, Position } from "./economic.js";
 import { buildTickMessages } from "./prompt.js";
+import type { Hambre } from "./prompt.js";
 import type { LLMClient, ChatMessage, ToolCallEmission } from "./llm.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { MemoryStore } from "../memory/store.js";
@@ -73,9 +74,60 @@ export interface TickResult {
 function labMode(): boolean {
   return process.env.KAIZEN_LAB_MODE === "1";
 }
+/** Pasos por tick. 0 = SIN TOPE: sigue hasta que ella deje de pedir
+ *  herramientas o hasta que se detecte que está girando en el lugar.
+ *
+ *  El tope de 20 que había era una limitación arbitraria, no seguridad —
+ *  los frenos de dinero los pone la Policy Engine en cada paso. */
 function labMaxSteps(): number {
-  const n = Number(process.env.KAIZEN_LAB_MAX_STEPS || 6);
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 20) : 6;
+  const raw = process.env.KAIZEN_LAB_MAX_STEPS;
+  if (raw === "0" || raw === "infinito" || raw === "sin-tope") return Infinity;
+  const n = Number(raw || 6);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6;
+}
+
+/** Sólo para tests: expone la lectura del tope de pasos sin tener que
+ *  montar un tick completo. */
+export const pasosMaximosParaTest = labMaxSteps;
+
+/** Detecta que se quedó trabada repitiendo la MISMA llamada.
+ *
+ *  Con pasos ilimitados esto no es un límite: es la diferencia entre
+ *  trabajar y girar en el vacío quemando tokens. Sólo corta cuando repite
+ *  herramienta Y argumentos idénticos — cambiar de enfoque nunca la corta.
+ */
+class DetectorDeVueltas {
+  private vistas = new Map<string, number>();
+  private readonly tope: number;
+  constructor(tope = Number(process.env.KAIZEN_REPETICIONES_MAX || 3)) {
+    this.tope = Number.isFinite(tope) && tope > 0 ? Math.floor(tope) : 3;
+  }
+  /** true si ya repitió esta llamada exacta demasiadas veces. */
+  trabada(tool: string, args: string): boolean {
+    const k = `${tool}::${args}`;
+    const n = (this.vistas.get(k) ?? 0) + 1;
+    this.vistas.set(k, n);
+    return n > this.tope;
+  }
+}
+
+/** Modo hambre: le pone precio a existir.
+ *
+ *  Sin esto, esperar sale gratis y por lo tanto siempre gana — la opción
+ *  segura es no hacer nada para siempre, que es exactamente lo que se
+ *  observó en las primeras corridas. Con costo de vida, la inacción se
+ *  paga y una operación de valor esperado positivo pasa a ser racional.
+ *
+ *  KAIZEN_HAMBRE=1 lo activa. Apagado (por defecto) no cambia nada.
+ */
+function modoHambre(): Hambre | undefined {
+  if (process.env.KAIZEN_HAMBRE !== "1") return undefined;
+  const quema = Number(process.env.KAIZEN_HAMBRE_USD_DIA || 0.5);
+  const piso = Number(process.env.KAIZEN_HAMBRE_PISO_USD || 1);
+  return {
+    quemaUsdDia: Number.isFinite(quema) && quema > 0 ? quema : 0.5,
+    pisoUsd: Number.isFinite(piso) && piso >= 0 ? piso : 1,
+  };
 }
 
 export class DecisionLoop {
@@ -139,6 +191,7 @@ export class DecisionLoop {
         // repetía igual.
         recentTurns: mem.recentTurns(12),
         lecciones: mem.lecciones(12),
+        hambre: modoHambre(),
       });
     } finally { mem.close(); }
 
@@ -177,8 +230,10 @@ export class DecisionLoop {
         totals.prompt += u.prompt; totals.completion += u.completion; totals.total += u.total;
       };
       addUsage(current.usage);
+      const detector = new DetectorDeVueltas();
+      let trabada = false;
 
-      for (let i = 0; i < maxSteps; i += 1) {
+      for (let i = 0; i < maxSteps && !trabada; i += 1) {
         const calls = current.toolCalls ?? [];
         if (!calls.length) break;
 
@@ -194,6 +249,17 @@ export class DecisionLoop {
 
         // Todas las herramientas que pidió en este paso, no sólo la primera.
         for (const c of calls) {
+          // Girar repitiendo la MISMA llamada no es trabajar: es quemar
+          // tokens. Cambiar de enfoque nunca corta acá.
+          if (detector.trabada(c.function.name, c.function.arguments || "")) {
+            trabada = true;
+            lastOutcome = {
+              kind: "waited",
+              reason: `Se detuvo sola: repitió ${c.function.name} con los mismos argumentos ` +
+                      `sin avanzar. Hay que cambiar de enfoque, no insistir.`,
+            };
+            break;
+          }
           lastOutcome = await this.executeCall(input.agentId, c, input.agentState);
           steps.push({ tool: c.function.name, outcome: lastOutcome, rationale: current.content });
           messages.push({
@@ -204,7 +270,7 @@ export class DecisionLoop {
           } as ChatMessage);
         }
 
-        if (i === maxSteps - 1) break;
+        if (trabada || i === maxSteps - 1) break;
         current = await this.llm.chat(messages, toolSchema);
         addUsage(current.usage);
         this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);

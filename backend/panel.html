@@ -67,10 +67,11 @@
   </div>
 
   <div class="tarjeta">
-    <button id="btn">Soltarla</button>
+    <button id="btn">Soltarla una vez</button>
+    <button class="gris" id="btnLoop">Ponerla en bucle continuo</button>
     <button class="gris" id="btnRef">Actualizar estado</button>
-    <p class="aviso">Mueve dinero real. Puede tardar varios minutos: encadena hasta 10 pasos
-      y cada uno consulta al modelo. No cierres esta pestaña mientras trabaja.</p>
+    <p class="aviso" id="avisoLoop">Mueve dinero real. En bucle sigue sola hasta que la pares.
+      Cada ciclo encadena pasos sin tope hasta que deje de pedir herramientas.</p>
   </div>
 
   <div class="tarjeta oculto" id="cajaPasos">
@@ -106,6 +107,8 @@ async function cargarEstado() {
   $("gas").textContent = d2(s.gasReserveUsd);
   $("dd").textContent = s.drawdownPct.toFixed(1) + "%";
   $("est").textContent = s.suggestedStatus;
+  enBucle = Boolean(d.record?.autoTick?.enabled);
+  pintarLoop();
   if (d.rates) {
     $("precio").textContent = "Valuado con precios de mercado: ETH $" +
       Number(d.rates[8453]).toFixed(2) + " · POL $" + Number(d.rates[137]).toFixed(4);
@@ -134,6 +137,34 @@ async function cargarGanancia() {
 }
 
 $("btnRef").onclick = () => cargarEstado();
+
+// ── Bucle continuo ──────────────────────────────────────────────────
+// Usa el AutoTickScheduler que ya existía en el backend: no es un bucle
+// del navegador, así que sigue corriendo aunque cierres la pestaña.
+let enBucle = false;
+function pintarLoop() {
+  $("btnLoop").textContent = enBucle ? "PARARLA" : "Ponerla en bucle continuo";
+  $("btnLoop").style.color = enBucle ? "var(--rojo)" : "";
+  $("avisoLoop").textContent = enBucle
+    ? "Corriendo sola en el servidor. Sigue aunque cierres esta pestaña. Apretá PARARLA para detenerla."
+    : "Mueve dinero real. En bucle sigue sola hasta que la pares. Cada ciclo encadena pasos sin tope.";
+}
+$("btnLoop").onclick = async () => {
+  const nuevo = !enBucle;
+  $("btnLoop").disabled = true;
+  try {
+    const r = await fetch("/agents/agt_demo/schedule", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: nuevo, intervalSeconds: 60 }),
+    });
+    if (r.ok) { enBucle = nuevo; pintarLoop(); }
+    else $("avisoLoop").textContent = "No se pudo cambiar el bucle: " + (await r.text()).slice(0, 120);
+  } catch (e) {
+    $("avisoLoop").textContent = "Falló: " + e.message;
+  }
+  $("btnLoop").disabled = false;
+};
 
 $("btn").onclick = async () => {
   const b = $("btn");

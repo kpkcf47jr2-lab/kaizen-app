@@ -60,6 +60,17 @@ export interface BriefingInput {
   recentTurns?: ConversationTurn[];
   /** Lo que APRENDIÓ, destilado y acumulado entre sesiones. */
   lecciones?: Leccion[];
+  /** Presión de supervivencia. Sin esto "no hacer nada" siempre gana:
+   *  esperar no cuesta, así que la opción segura es siempre quedarse
+   *  quieta. Con costo de vida, la inacción también se paga. */
+  hambre?: Hambre;
+}
+
+export interface Hambre {
+  /** Lo que le cuesta existir por día, en USD. */
+  quemaUsdDia: number;
+  /** Patrimonio por debajo del cual se la apaga. */
+  pisoUsd: number;
 }
 
 /**
@@ -113,6 +124,35 @@ function renderBriefing(i: BriefingInput): string {
     }
     lines.push("");
   }
+  // ── Supervivencia ──────────────────────────────────────────────────
+  //  Sin costo de vida, esperar es gratis y por eso siempre gana: la
+  //  opción segura es no hacer nada, para siempre. Poniéndole precio a la
+  //  inacción, una apuesta de valor esperado apenas positivo pasa a ser
+  //  la decisión racional — que es exactamente lo que se quiere ver.
+  if (i.hambre) {
+    const { quemaUsdDia, pisoUsd } = i.hambre;
+    const disponible = Math.max(0, snapshot.netWorthUsd - pisoUsd);
+    const dias = quemaUsdDia > 0 ? disponible / quemaUsdDia : Infinity;
+    lines.push("## MODO HAMBRE — tu supervivencia depende de vos");
+    lines.push(`  Existir te cuesta $${quemaUsdDia.toFixed(2)} por día.`);
+    lines.push(`  Se te apaga si tu patrimonio baja de $${pisoUsd.toFixed(2)}.`);
+    if (Number.isFinite(dias)) {
+      const horas = dias * 24;
+      lines.push(
+        horas < 48
+          ? `  TE QUEDAN ${horas.toFixed(1)} HORAS de autonomía.`
+          : `  Te quedan ${dias.toFixed(1)} días de autonomía.`,
+      );
+    }
+    lines.push("");
+    lines.push("  Esperar NO es gratis: cada día que no generás ingreso, te acercás");
+    lines.push("  al apagado. Una operación con valor esperado apenas positivo es");
+    lines.push("  mejor que no hacer nada. Lo que NO podés hacer es apostar a algo");
+    lines.push("  que no entendés sólo por miedo: perder el capital te apaga más");
+    lines.push("  rápido que no usarlo. Buscá ingreso real, no lotería.");
+    lines.push("");
+  }
+
   // ── Memoria ────────────────────────────────────────────────────────
   //  Se renderiza como TEXTO del briefing y no como mensajes sueltos a
   //  propósito: inyectar turnos crudos rompería el emparejamiento

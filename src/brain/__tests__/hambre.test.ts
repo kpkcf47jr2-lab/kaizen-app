@@ -1,0 +1,105 @@
+// Modo hambre y pasos sin tope.
+//
+// El hallazgo que motivó esto: en cuatro corridas la agente investigó bien,
+// concluyó correctamente que no había nada bueno, y no hizo nada. Sin costo
+// de vida, esperar es gratis — y una opción gratis siempre le gana a una
+// que arriesga. Ponerle precio a la inacción cambia ese cálculo.
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { buildTickMessages } from "../prompt.js";
+import type { AgentRecord } from "../../agent/registry.js";
+import type { Snapshot, BudgetProposal } from "../economic.js";
+
+const agente: AgentRecord = {
+  agentId: "agt_test", displayName: "Test", address: "0x" + "1".repeat(40),
+  parentAgentId: null, createdAt: new Date().toISOString(),
+  status: "GROWING" as AgentRecord["status"], peakNetWorthUsd: 10,
+};
+
+const snapCon = (neto: number) => ({
+  agentId: "agt_test", ts: Date.now(), netWorthUsd: neto, cashUsd: 3,
+  gasReserveUsd: 2, investedUsd: 1.5, outflow24hUsd: 0, outflow7dUsd: 0,
+  peakNetWorthUsd: 10, drawdownPct: 0, suggestedStatus: "GROWING",
+} as unknown as Snapshot);
+
+const budget = {
+  reserveUsd: 1, tradingUsd: 2, marketingUsd: 0,
+  productAcquisitionUsd: 0, infrastructureUsd: 0, experimentationUsd: 1,
+} as unknown as BudgetProposal;
+
+const texto = (neto: number, hambre?: { quemaUsdDia: number; pisoUsd: number }) =>
+  buildTickMessages({
+    agent: agente, snapshot: snapCon(neto), budget,
+    recentEvents: [], toolNames: ["web.search"], hambre,
+  }).map((m) => m.content ?? "").join("\n");
+
+describe("modo hambre", () => {
+  it("apagado, el briefing no menciona supervivencia", () => {
+    expect(texto(6.55)).not.toContain("MODO HAMBRE");
+  });
+
+  it("encendido, le dice cuánto cuesta existir y cuándo se apaga", () => {
+    const t = texto(6.55, { quemaUsdDia: 0.5, pisoUsd: 1 });
+    expect(t).toContain("MODO HAMBRE");
+    expect(t).toContain("$0.50 por día");
+    expect(t).toContain("baja de $1.00");
+  });
+
+  it("con poca autonomía avisa en HORAS, que aprieta más que días", () => {
+    // (2.00 − 1.00) / 1.00 = 1 día = 24 horas
+    const t = texto(2, { quemaUsdDia: 1, pisoUsd: 1 });
+    expect(t).toContain("TE QUEDAN 24.0 HORAS");
+  });
+
+  it("con holgura habla en días", () => {
+    // (11 − 1) / 0.5 = 20 días
+    const t = texto(11, { quemaUsdDia: 0.5, pisoUsd: 1 });
+    expect(t).toContain("20.0 días");
+  });
+
+  it("bajo el piso no calcula autonomía negativa", () => {
+    // Decirle "te quedan −13 horas" no significa nada; se satura en cero.
+    const t = texto(0.5, { quemaUsdDia: 0.5, pisoUsd: 1 });
+    expect(t).toContain("MODO HAMBRE");
+    expect(t).toContain("0.0 HORAS");
+    expect(t).not.toMatch(/-\d+(\.\d+)?\s*(HORAS|días)/);
+  });
+
+  it("empuja a actuar pero NO a apostar a ciegas", () => {
+    const t = texto(6.55, { quemaUsdDia: 0.5, pisoUsd: 1 });
+    // La presión sin este contrapeso produce lotería, no ingreso.
+    expect(t).toContain("Esperar NO es gratis");
+    expect(t).toContain("no entendés");
+    expect(t).toContain("no lotería");
+  });
+});
+
+// El tope de pasos vive en decisionLoop; se prueba su lectura del entorno
+// a través del comportamiento observable del modo laboratorio.
+describe("pasos sin tope", () => {
+  beforeEach(() => { process.env.KAIZEN_LAB_MODE = "1"; });
+  afterEach(() => {
+    delete process.env.KAIZEN_LAB_MODE;
+    delete process.env.KAIZEN_LAB_MAX_STEPS;
+  });
+
+  it("acepta 0, 'infinito' y 'sin-tope' como sin límite", async () => {
+    const { pasosMaximosParaTest } = await import("../decisionLoop.js");
+    for (const v of ["0", "infinito", "sin-tope"]) {
+      process.env.KAIZEN_LAB_MAX_STEPS = v;
+      expect(pasosMaximosParaTest(), `falló con "${v}"`).toBe(Infinity);
+    }
+  });
+
+  it("un número lo respeta tal cual, sin recortarlo a 20", async () => {
+    const { pasosMaximosParaTest } = await import("../decisionLoop.js");
+    process.env.KAIZEN_LAB_MAX_STEPS = "150";
+    expect(pasosMaximosParaTest()).toBe(150);
+  });
+
+  it("un valor basura cae al default y no rompe", async () => {
+    const { pasosMaximosParaTest } = await import("../decisionLoop.js");
+    process.env.KAIZEN_LAB_MAX_STEPS = "no-soy-un-numero";
+    expect(pasosMaximosParaTest()).toBe(6);
+  });
+});
