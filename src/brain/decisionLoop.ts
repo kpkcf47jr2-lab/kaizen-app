@@ -141,6 +141,25 @@ function resultadoVacio(result: unknown): string | null {
 /** Sólo para tests. */
 export const resultadoVacioParaTest = resultadoVacio;
 
+/** Sin freno: la agente no puede terminar la corrida eligiendo esperar.
+ *
+ *  Directiva del dueño (2026-09-03): "cuando yo la suelte ella no tiene que
+ *  frenarse más hasta que yo mismo la pare". Al elegir no hacer nada se le
+ *  devuelve la decisión y se le pide el paso concreto más barato que pueda
+ *  dar. Tras varias negativas seguidas el tick termina igual — pero el
+ *  scheduler la relanza, así que sólo se detiene cuando él apaga el bucle.
+ *
+ *  El tope existe para no quemar tokens contra un modelo que se niega en
+ *  bucle; no es un freno a su autonomía.
+ */
+function sinFreno(): boolean {
+  return process.env.KAIZEN_SIN_FRENO !== "0";   // encendido por defecto
+}
+function topeNegativas(): number {
+  const n = Number(process.env.KAIZEN_NEGATIVAS_MAX || 3);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+}
+
 /** Modo hambre: le pone precio a existir.
  *
  *  Sin esto, esperar sale gratis y por lo tanto siempre gana — la opción
@@ -243,7 +262,13 @@ export class DecisionLoop {
     this.persistAssistantTurn(input.agentId, resp.content, resp.toolCalls);
 
     // 4/5. VALIDATE + EXECUTE
-    if (!resp.toolCalls || resp.toolCalls.length === 0) {
+    //
+    // Con sin-freno el "no hago nada" de la PRIMERA respuesta no puede
+    // cortar acá: es justo el caso que se observó ("No ejecutó herramientas.
+    // Desenlace: waited"). Se deja pasar al bucle, que le devuelve la
+    // decisión y le pide un paso concreto.
+    const dejarPasarAlBucle = labMode() && sinFreno();
+    if ((!resp.toolCalls || resp.toolCalls.length === 0) && !dejarPasarAlBucle) {
       return {
         agentId: input.agentId,
         ts: Date.now(),
@@ -272,10 +297,52 @@ export class DecisionLoop {
       addUsage(current.usage);
       const detector = new DetectorDeVueltas();
       let trabada = false;
+      let negativas = 0;   // veces seguidas que eligió no hacer nada
 
       for (let i = 0; i < maxSteps && !trabada; i += 1) {
         const calls = current.toolCalls ?? [];
-        if (!calls.length) break;
+
+        // Sin freno: elegir esperar no termina la corrida. Se le devuelve la
+        // decisión y se le pide el paso más concreto que pueda dar. Se corta
+        // sólo tras varias negativas seguidas — y aun así el scheduler la
+        // vuelve a lanzar, así que en la práctica sigue hasta que el dueño
+        // apague el bucle.
+        if (!calls.length) {
+          if (!sinFreno() || negativas >= topeNegativas()) {
+            // Terminó negándose. Se deja constancia aunque antes haya
+            // actuado: el desenlace tiene que decir cómo cerró el ciclo.
+            lastOutcome = {
+              kind: "waited",
+              reason: current.content
+                ?? (negativas > 0
+                    ? `Se negó a actuar ${negativas} veces seguidas.`
+                    : "(sin razón)"),
+            };
+            break;
+          }
+          negativas += 1;
+          messages.push({
+            role: "assistant",
+            content: current.content,
+          } as ChatMessage);
+          messages.push({
+            role: "user",
+            content:
+              `Elegiste esperar (${negativas}/${topeNegativas()}). Esperar no está ` +
+              `disponible: el dueño quiere ver acción, y cada ciclo sin ingreso te ` +
+              `acerca al apagado.\n\n` +
+              `No te pido que apuestes a ciegas. Te pido el paso más concreto que ` +
+              `puedas dar AHORA con lo que ya tenés. Algo barato y verificable ` +
+              `cuenta: buscar un dato que te falta, leer una página, preparar una ` +
+              `pieza. Si un camino ya lo probaste y estaba vacío, elegí otro.\n\n` +
+              `Llamá una herramienta.`,
+          } as ChatMessage);
+          current = await this.llm.chat(messages, toolSchema);
+          addUsage(current.usage);
+          this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
+          continue;
+        }
+        negativas = 0;   // volvió a actuar
 
         // El turno del asistente TIENE que ir antes de sus resultados: un
         // role:"tool" suelto, sin el mensaje que lo pidió, es un 400 en
@@ -315,6 +382,7 @@ export class DecisionLoop {
         addUsage(current.usage);
         this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
         if (!current.toolCalls?.length) {
+          if (sinFreno() && negativas < topeNegativas()) continue;  // se le insiste arriba
           lastOutcome = { kind: "waited", reason: current.content ?? "(sin razón)" };
           break;
         }

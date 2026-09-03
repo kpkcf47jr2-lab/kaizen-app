@@ -165,3 +165,60 @@ describe("modo laboratorio — forma de la conversación", () => {
     expect(r.outcome.kind).toBe("tool_call");
   });
 });
+
+// Directiva del dueño (2026-09-03): "cuando yo la suelte ella no tiene que
+// frenarse más hasta que yo mismo la pare". Elegir esperar ya no termina la
+// corrida: se le devuelve la decisión y se le pide un paso concreto.
+describe("sin freno — no puede terminar eligiendo esperar", () => {
+  afterEach(() => {
+    delete process.env.KAIZEN_SIN_FRENO;
+    delete process.env.KAIZEN_NEGATIVAS_MAX;
+  });
+
+  it("si se niega en el PRIMER turno igual se le insiste", async () => {
+    process.env.KAIZEN_NEGATIVAS_MAX = "2";
+    const { llm, loop } = mkLoop([
+      { content: "prefiero esperar", toolCalls: [], finishReason: "stop" },
+      { content: "bueno, busco", toolCalls: [call("c1", "web.search")], finishReason: "tool_calls" },
+      { content: "listo", toolCalls: [], finishReason: "stop" },
+    ]);
+    const r = await tick(loop);
+    // Antes esto cortaba en la primera respuesta sin llamar a nada.
+    expect(llm.seen.length).toBeGreaterThan(1);
+    expect(r.steps?.some((s) => s.tool === "web.search")).toBe(true);
+  });
+
+  it("la insistencia le dice que esperar no está disponible", async () => {
+    process.env.KAIZEN_NEGATIVAS_MAX = "1";
+    const { llm, loop } = mkLoop([
+      { content: "espero", toolCalls: [], finishReason: "stop" },
+      { content: "ok", toolCalls: [call("c1", "web.search")], finishReason: "tool_calls" },
+      { content: "fin", toolCalls: [], finishReason: "stop" },
+    ]);
+    await tick(loop);
+    const texto = llm.seen[1].map((m) => m.content ?? "").join("\n");
+    expect(texto).toContain("Esperar no está");
+    expect(texto).toContain("no te pido que apuestes a ciegas".replace("no ", "No "));
+  });
+
+  it("se rinde tras el tope y lo deja registrado", async () => {
+    process.env.KAIZEN_NEGATIVAS_MAX = "2";
+    const { llm, loop } = mkLoop([
+      { content: "no quiero", toolCalls: [], finishReason: "stop" },
+    ]);
+    const r = await tick(loop);
+    expect(r.outcome.kind).toBe("waited");
+    // 1 inicial + 2 insistencias, y no más: no puede quemar tokens sin fin.
+    expect(llm.seen.length).toBe(3);
+  });
+
+  it("apagado con KAIZEN_SIN_FRENO=0, vuelve al comportamiento viejo", async () => {
+    process.env.KAIZEN_SIN_FRENO = "0";
+    const { llm, loop } = mkLoop([
+      { content: "espero", toolCalls: [], finishReason: "stop" },
+    ]);
+    const r = await tick(loop);
+    expect(llm.seen).toHaveLength(1);
+    expect(r.outcome.kind).toBe("waited");
+  });
+});
