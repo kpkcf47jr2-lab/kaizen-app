@@ -8,20 +8,21 @@
 //  Spheron corre sobre BASE con escrow on-chain, y el SDK firma con una
 //  llave privada — así ella paga su propio cómputo sin intermediario.
 //
-//  ⚠ VERIFICADO CONTRA EL SDK REAL (2026-09-03, @spheron/protocol-sdk 2.6.0).
-//  Lo que este archivo afirmaba antes era falso y habría fallado en cada
-//  intento:
+//  ⚠ VERIFICADO CONTRA EL SDK REAL (2026-09-03, @spheron/protocol-sdk 2.6.0):
 //
 //    · El escrow de mainnet NO acepta USDC. getUserBalance("USDC") tira
-//      "Transaction failed without revert data". El único símbolo en el
-//      tokenMap de mainnet es uSPON.
-//    · Y el uSPON de "mainnet" apunta a la constante uSPONTestnet
-//      (0xeD8F…23D2), que NO tiene código en Base mainnet (8453) — sólo en
-//      Base Sepolia (84532).
+//      "Transaction failed without revert data". Los únicos símbolos que
+//      responden son uSPON y SPON.
+//    · uSPON es "USD Pegged SPON" (0xBf0f…0f5e), desplegado y vivo en Base
+//      mainnet. El SDK define ADEMÁS uSPONTestnet (0xeD8F…23D2), que no
+//      existe en mainnet: confundirlas hace creer que la red está rota.
+//    · Los seis métodos que usa este adaptador existen con estas firmas:
+//      getUserBalance(token, wallet), depositBalance({token,amount}),
+//      withdrawBalance({token,amount}), createDeployment(icl, proxyUrl),
+//      getDeployment(leaseId, proxyUrl), closeDeployment(leaseId).
 //
-//  O sea: con esta versión del SDK, Spheron sólo es usable en TESTNET.
-//  `redUsable()` lo detecta antes de gastar y lo explica, en vez de dejar
-//  que la agente falle depositando contra un contrato inexistente.
+//  O sea: el riel funciona, pero se paga en uSPON. Para pagarlo con el USDC
+//  que ella tiene hace falta el paso previo USDC → uSPON.
 //
 //  SEGURIDAD — por qué esto recibe una función y no una llave:
 //  la llave de Kaizen vive cifrada en el vault y sólo se abre dentro del
@@ -48,9 +49,11 @@ export interface SpheronConfig {
 
 /** Sin listado on-chain, el catálogo es explícito y auditable: `list()` no
  *  inventa precios. Referencia de Spheron al 2026-09-03. */
-/** Dirección del uSPON que el SDK usa. Verificado el 2026-09-03: tiene código
- *  en Base Sepolia (84532) y NO existe en Base mainnet (8453). */
-const USPON_ADDR = "0xeD8F325cDc2BA7567395cb451A2ea8FAf40E23D2";
+/** uSPON de MAINNET. Verificado on-chain el 2026-09-03: 22.700 bytes de
+ *  código en Base mainnet (8453). Ojo: el SDK define también uSPONTestnet
+ *  (0xeD8F…23D2), que NO existe en mainnet — confundirlas hace creer que la
+ *  red entera está rota cuando no lo está. */
+const USPON_ADDR = "0xBf0fA0461331d815A103e59929E5a19A48C30f5e";
 
 const DEFAULT_CATALOG: GpuOption[] = [
   { id: "rtx4090", name: "RTX 4090 24GB", hourlyUsd: 0.35, vramGb: 24 },
@@ -81,33 +84,44 @@ export class SpheronComputeProvider implements ComputeProvider {
     };
   }
 
-  /** Comprueba que la red elegida sea realmente usable ANTES de gastar.
+  /** Comprueba que se pueda pagar ANTES de gastar.
    *
-   *  Hace falta porque el SDK 2.6.0 apunta el uSPON de "mainnet" a la
-   *  constante uSPONTestnet (0xeD8F…23D2), y ese contrato NO está desplegado
-   *  en Base mainnet — sólo en Base Sepolia. Sin esta comprobación la agente
-   *  intentaría depositar contra un contrato inexistente, fallaría sin
-   *  mensaje claro, y volvería a intentarlo sin entender por qué.
+   *  El escrow de mainnet cobra en uSPON, no en USDC. Verificado el
+   *  2026-09-03: no hay liquidez USDC → uSPON en ningún DEX de Base, así que
+   *  la agente no puede conseguir uSPON por su cuenta partiendo del USDC que
+   *  tiene. Decírselo con ese detalle evita que lo reintente sin entender.
    */
   async redUsable(): Promise<{ ok: boolean; motivo?: string }> {
     if (this.cfg.networkType !== "mainnet") return { ok: true };
     try {
       const { ethers } = await import("ethers");
       const prov = new ethers.JsonRpcProvider("https://mainnet.base.org");
-      const code = await prov.getCode(USPON_ADDR);
-      if (code === "0x") {
+      if ((await prov.getCode(USPON_ADDR)) === "0x") {
+        return { ok: false, motivo: `El token uSPON (${USPON_ADDR}) no responde en Base mainnet.` };
+      }
+      const saldo = await new ethers.Contract(
+        USPON_ADDR, ["function balanceOf(address) view returns (uint256)"], prov,
+      ).balanceOf(await this.direccion()).catch(() => 0n);
+      if (saldo === 0n) {
         return {
           ok: false,
           motivo:
-            `El token uSPON (${USPON_ADDR}) no está desplegado en Base mainnet — ` +
-            `el SDK apunta ahí una dirección de testnet. Spheron mainnet no es ` +
-            `usable con esta versión del SDK. Usá networkType:"testnet".`,
+            "Spheron cobra en uSPON y no tenés uSPON. Tu USDC no sirve directo, " +
+            "y no hay liquidez USDC → uSPON en ningún DEX de Base, así que no " +
+            "podés conseguirlo cambiando. Hay que adquirirlo por fuera. " +
+            "No reintentes este camino hasta tener uSPON en la wallet.",
         };
       }
       return { ok: true };
     } catch (e) {
-      return { ok: false, motivo: `No se pudo verificar la red: ${(e as Error).message}` };
+      return { ok: false, motivo: `No se pudo verificar: ${(e as Error).message}` };
     }
+  }
+
+  /** Dirección pública de la wallet que firma. */
+  private async direccion(): Promise<string> {
+    const { ethers } = await import("ethers");
+    return new ethers.Wallet(await this.cfg.getPrivateKey()).address;
   }
 
   /** El SDK se construye por operación y se descarta: la llave no queda

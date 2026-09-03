@@ -110,9 +110,9 @@ describe("token y red — verificado contra @spheron/protocol-sdk 2.6.0", () => 
   it("no arranca un alquiler si la red no sirve, y dice por qué", async () => {
     const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "mainnet" });
     // Se fuerza el veredicto para no depender de la red en los tests.
-    p.redUsable = async () => ({ ok: false, motivo: "uSPON no existe en Base mainnet" });
+    p.redUsable = async () => ({ ok: false, motivo: "Spheron cobra en uSPON y no tenés uSPON" });
     const r = await p.rent({ gpuTypeId: "rtx4090", hoursMax: 1 } as never);
     expect(r.status).toBe("failed");
-    expect(r.reason).toContain("uSPON no existe");
+    expect(r.reason).toContain("no tenés uSPON");
   });
 });
