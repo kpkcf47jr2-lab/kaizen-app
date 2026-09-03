@@ -71,6 +71,35 @@ export const USDC_BY_CHAIN: Record<number, typeof USDC_POLYGON> = {
   8453: USDC_BASE,
 };
 
+
+// ── Tokens que cuentan como POSICIÓN ──────────────────────────────────
+//
+//  Sin esto la agente es CIEGA a lo que compra: `readBalances` sólo leía USDC
+//  y el nativo, así que un swap a WETH le desaparecía del patrimonio. Contaba
+//  el dinero gastado como perdido y no contaba el activo recibido.
+//
+//  El efecto era una trampa que se refuerza sola: cada inversión hundía su
+//  drawdown, el drawdown la clasificaba CRITICAL, y CRITICAL le ponía el
+//  presupuesto en cero. Cuanto más invertía, menos se permitía hacer.
+//  Medido el 2026-09-03: creía tener $5.59 con 26.4% de caída; tenía $7.05
+//  con 7.2%.
+export interface PositionToken {
+  address: string;
+  decimals: number;
+  symbol: string;
+  /** Símbolo con el que se le pide el precio al motor de mercado. */
+  priceSymbol: string;
+}
+
+export const POSITION_TOKENS_BY_CHAIN: Record<number, PositionToken[]> = {
+  8453: [
+    { address: "0x4200000000000000000000000000000000000006", decimals: 18, symbol: "WETH", priceSymbol: "ETH" },
+  ],
+  137: [
+    { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18, symbol: "WETH", priceSymbol: "ETH" },
+  ],
+};
+
 // ── Vault store abstraction ──────────────────────────────────────────
 // For MVP: JSON file on disk. Prod: KMS / HSM / hardware-backed store.
 export interface VaultStore {
@@ -167,6 +196,8 @@ export class SecureWalletService {
     pol: number;
     native: number;
     byChain: Record<number, { usdc: number; native: number; nativeSymbol: string }>;
+    /** Tokens que la agente TIENE. Sin esto no ve lo que compra. */
+    holdings: Array<{ chainId: number; symbol: string; priceSymbol: string; amount: number }>;
   }> {
     const address = await this.addressFor(agentId);
     const chainIds = Object.keys(CHAINS).map(Number);
@@ -175,14 +206,22 @@ export class SecureWalletService {
         const chain = CHAINS[id];
         const usdcConfig = USDC_BY_CHAIN[id];
         if (!chain || !usdcConfig) return { id, usdc: 0, native: 0 };
-        const [u, n] = await Promise.all([
+        const [u, n, held] = await Promise.all([
           erc20Balance(chain, usdcConfig.address, address).catch(() => ({ formatted: 0 })),
           nativeBalance(chain, address).catch(() => 0),
+          Promise.all(
+            (POSITION_TOKENS_BY_CHAIN[id] || []).map(async (t) => ({
+              symbol: t.symbol,
+              priceSymbol: t.priceSymbol,
+              amount: (await erc20Balance(chain, t.address, address).catch(() => ({ formatted: 0 }))).formatted,
+            })),
+          ),
         ]);
-        return { id, usdc: u.formatted, native: n };
+        return { id, usdc: u.formatted, native: n, held: held.filter((h) => h.amount > 0) };
       }),
     );
     const byChain: Record<number, { usdc: number; native: number; nativeSymbol: string }> = {};
+    const holdings: Array<{ chainId: number; symbol: string; priceSymbol: string; amount: number }> = [];
     let sumUsdc = 0;
     let sumNative = 0;
     for (const r of perChain) {
@@ -190,11 +229,34 @@ export class SecureWalletService {
       byChain[r.id] = { usdc: r.usdc, native: r.native, nativeSymbol: symbol };
       sumUsdc += r.usdc;
       sumNative += r.native;
+      for (const h of (r as { held?: Array<{ symbol: string; priceSymbol: string; amount: number }> }).held || []) {
+        holdings.push({ chainId: r.id, symbol: h.symbol, priceSymbol: h.priceSymbol, amount: h.amount });
+      }
     }
-    return { address, usdc: sumUsdc, pol: sumNative, native: sumNative, byChain };
+    return { address, usdc: sumUsdc, pol: sumNative, native: sumNative, byChain, holdings };
   }
 
   /** Public address for an agent (derivation, no signing). */
+  /** ⚠️ ÚNICA salida de la llave privada fuera de esta clase.
+   *
+   *  El resto del servicio mantiene la invariante de no exponerla nunca: abre
+   *  el vault, firma adentro y descarta. Pero el SDK de Spheron EXIGE la llave
+   *  en su constructor y no acepta un signer, así que para que Kaizen pueda
+   *  pagar su propio cómputo hay que entregársela.
+   *
+   *  Se aísla acá, con nombre rastreable, para que una auditoría encuentre de
+   *  un grep todos los lugares que la sacan. No la cachea, no la loguea, y el
+   *  llamador debe usarla y soltarla.
+   *
+   *  Si algún día Spheron acepta un signer externo, este método se borra.
+   */
+  async exportPrivateKeyForSpheron(agentId: string): Promise<string> {
+    const blob = await this.vaultStore.load(agentId);
+    if (!blob) throw new Error(`No vault for agent ${agentId}`);
+    const mnemonic = await openVault(blob, this.passphrase);
+    return deriveEvmAccount(mnemonic).privateKey;
+  }
+
   async addressFor(agentId: string): Promise<string> {
     const blob = await this.vaultStore.load(agentId);
     if (!blob) throw new Error(`No vault for agent ${agentId}`);

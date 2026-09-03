@@ -24,6 +24,7 @@
     "@kaizen/wallet-core": "*",
     "@scure/bip32": "^1.7.0",
     "@scure/bip39": "^1.4.0",
+    "@spheron/protocol-sdk": "^2.6.0",
     "better-sqlite3": "^11.3.0",
     "cheerio": "^1.2.0",
     "cors": "^2.8.5",

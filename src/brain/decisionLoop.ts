@@ -14,6 +14,8 @@
 //  Ticks are independent. The agent can be ticked from cron, from an
 //  HTTP endpoint (POST /tick), or from a long-running scheduler. Each
 //  tick is a bounded unit of work: at most one tool call, then done.
+//  (KAIZEN_LAB_MODE=1 encadena varios pasos por tick — ver "Modo
+//  laboratorio" más abajo. Los topes de la Policy Engine no cambian.)
 // ═══════════════════════════════════════════════════════════════════════
 
 import {
@@ -21,7 +23,7 @@ import {
   type AgentState,
 } from "../policy/engine.js";
 import { snapshot, proposeBudget } from "./economic.js";
-import type { Snapshot, BudgetProposal, Balances } from "./economic.js";
+import type { Snapshot, BudgetProposal, Balances, Position } from "./economic.js";
 import { buildTickMessages } from "./prompt.js";
 import type { LLMClient, ChatMessage, ToolCallEmission } from "./llm.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -34,6 +36,8 @@ export interface TickInput {
   /** Provided by the caller — the composed source of truth (backend/wallet). */
   balances: Balances;
   agentState: AgentState;
+  /** Posiciones abiertas leídas on-chain. Sin esto se subestima el patrimonio. */
+  positions?: Position[];
 }
 
 export type TickOutcome =
@@ -50,6 +54,28 @@ export interface TickResult {
   outcome: TickOutcome;
   llmContent: string | null;
   usage?: { prompt: number; completion: number; total: number };
+  /** Cadena completa cuando el tick corre en varios pasos (modo laboratorio). */
+  steps?: Array<{ tool: string; outcome: TickOutcome; rationale: string | null }>;
+}
+
+// ── Modo laboratorio ──────────────────────────────────────────────────
+//
+//  El ciclo normal es de UN SOLO disparo: una llamada al modelo, se toma la
+//  primera herramienta, se ignora el resto y se termina. Eso impide encadenar
+//  observar → actuar → ver el resultado → decidir de nuevo, que es
+//  exactamente lo que hace capaz a un agente. No es un freno de seguridad:
+//  los topes de dinero (per-tx, diario, semanal, drawdown) los aplica la
+//  Policy Engine en CADA paso y siguen intactos acá.
+//
+//  Se activa con KAIZEN_LAB_MODE=1 y el número de pasos con
+//  KAIZEN_LAB_MAX_STEPS (por defecto 6). Apagado, el comportamiento es
+//  idéntico al de antes.
+function labMode(): boolean {
+  return process.env.KAIZEN_LAB_MODE === "1";
+}
+function labMaxSteps(): number {
+  const n = Number(process.env.KAIZEN_LAB_MAX_STEPS || 6);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 20) : 6;
 }
 
 export class DecisionLoop {
@@ -69,7 +95,11 @@ export class DecisionLoop {
     const snap = snapshot(
       input.agentId,
       input.balances,
-      [], // MVP: no open positions tracked yet
+      // Lo que TIENE. Antes acá iba un array vacío y la agente no veía sus
+      // propias posiciones: contaba lo gastado como pérdida sin contar el
+      // activo comprado, se auto-clasificaba CRITICAL por una caída falsa y
+      // se ponía el presupuesto en cero. Cuanto más invertía, menos podía.
+      input.positions ?? [],
       {
         outflow24hUsd: input.agentState.outflow24hUsd,
         outflow7dUsd: input.agentState.outflow7dUsd,
@@ -123,6 +153,70 @@ export class DecisionLoop {
         outcome: { kind: "waited", reason: resp.content ?? "(no rationale)" },
         llmContent: resp.content,
         usage: resp.usage,
+      };
+    }
+
+    // Modo laboratorio: se le devuelve al modelo el resultado de cada
+    // herramienta y se le deja decidir de nuevo, hasta agotar los pasos o
+    // hasta que deje de pedir herramientas. Cada paso pasa igual por la
+    // Policy Engine — los topes de dinero no se tocan.
+    if (labMode()) {
+      const steps: NonNullable<TickResult["steps"]> = [];
+      const maxSteps = labMaxSteps();
+      let current = resp;
+      let lastOutcome: TickOutcome = { kind: "waited", reason: current.content ?? "(sin razón)" };
+      const totals = { prompt: 0, completion: 0, total: 0 };
+      const addUsage = (u?: { prompt: number; completion: number; total: number }) => {
+        if (!u) return;
+        totals.prompt += u.prompt; totals.completion += u.completion; totals.total += u.total;
+      };
+      addUsage(current.usage);
+
+      for (let i = 0; i < maxSteps; i += 1) {
+        const calls = current.toolCalls ?? [];
+        if (!calls.length) break;
+
+        // El turno del asistente TIENE que ir antes de sus resultados: un
+        // role:"tool" suelto, sin el mensaje que lo pidió, es un 400 en
+        // cualquier API estilo OpenAI. persistAssistantTurn sólo escribe en
+        // memoria, no en esta conversación.
+        messages.push({
+          role: "assistant",
+          content: current.content,
+          tool_calls: calls,
+        } as ChatMessage);
+
+        // Todas las herramientas que pidió en este paso, no sólo la primera.
+        for (const c of calls) {
+          lastOutcome = await this.executeCall(input.agentId, c, input.agentState);
+          steps.push({ tool: c.function.name, outcome: lastOutcome, rationale: current.content });
+          messages.push({
+            role: "tool",
+            tool_call_id: c.id,
+            name: c.function.name,
+            content: JSON.stringify(lastOutcome),
+          } as ChatMessage);
+        }
+
+        if (i === maxSteps - 1) break;
+        current = await this.llm.chat(messages, toolSchema);
+        addUsage(current.usage);
+        this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
+        if (!current.toolCalls?.length) {
+          lastOutcome = { kind: "waited", reason: current.content ?? "(sin razón)" };
+          break;
+        }
+      }
+
+      return {
+        agentId: input.agentId,
+        ts: Date.now(),
+        snapshot: snap,
+        budget,
+        outcome: lastOutcome,
+        llmContent: current.content,
+        usage: totals,
+        steps,
       };
     }
 

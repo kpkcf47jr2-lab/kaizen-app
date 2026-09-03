@@ -65,6 +65,7 @@ import { RunpodProvider } from "../src/compute/runpod.js";
 import { LightningComputeProvider } from "../src/compute/lightning.js";
 import { NvidiaBrevProvider } from "../src/compute/nvidia-brev.js";
 import { MultiComputeProvider } from "../src/compute/multi.js";
+import { SpheronComputeProvider } from "../src/compute/spheron.js";
 import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
@@ -160,6 +161,20 @@ function makeApp() {
   if (process.env.RUNPOD_API_KEY)   availableProviders.runpod    = new RunpodProvider();
   if (process.env.LIGHTNING_API_KEY) availableProviders.lightning = new LightningComputeProvider();
   if (process.env.BREV_API_KEY)     availableProviders.nvidia    = new NvidiaBrevProvider();
+  // Spheron es el único que Kaizen paga POR SÍ MISMA: escrow on-chain en USDC
+  // sobre Base, firmado con su propia llave. Los otros tres cobran con API key
+  // contra la tarjeta de un humano, así que con ellos no se autoabastece.
+  //
+  // Se activa con KAIZEN_SPHERON=1 porque gasta USDC real sin intervención.
+  if (process.env.KAIZEN_SPHERON === "1") {
+    availableProviders.spheron = new SpheronComputeProvider({
+      networkType: process.env.KAIZEN_SPHERON_NETWORK === "testnet" ? "testnet" : "mainnet",
+      // La llave se pide en el momento de firmar y no se guarda.
+      getPrivateKey: () => walletService.exportPrivateKeyForSpheron(
+        process.env.KAIZEN_SPHERON_AGENT_ID || "agt_demo",
+      ),
+    });
+  }
   const computeProvider = Object.keys(availableProviders).length === 0
     ? new MockComputeProvider()
     : new MultiComputeProvider({ providers: availableProviders });
@@ -694,10 +709,22 @@ function makeApp() {
       for (const [idStr, per] of Object.entries(balances.byChain)) {
         gasUsdTotal += stateLoader.gasUsdFor(Number(idStr), per.native);
       }
+      // Lo que tiene comprado cuenta como patrimonio. Sin esto la agente
+      // lee cada inversión como pérdida y se paraliza sola.
+      const ethUsd = Number(process.env.KAIZEN_ETH_USD_RATE || 3200);
+      const positions = (balances.holdings || [])
+        .filter((h) => h.amount > 0)
+        .map((h) => {
+          const markUsd = h.priceSymbol === "ETH" ? h.amount * ethUsd : 0;
+          return { strategy: "held", asset: h.symbol, entryUsd: markUsd, currentUsd: markUsd };
+        })
+        .filter((p) => p.currentUsd > 0);
+
       const result = await decisionLoop.tick({
         agentId: req.params.id,
         operatorPrompt: req.body?.operatorPrompt,
         balances: { usdc: balances.usdc, pol: gasUsdTotal, polUsdRate: 1 },
+        positions,
         agentState,
       });
       res.json(result);
