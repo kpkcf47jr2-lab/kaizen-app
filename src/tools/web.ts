@@ -104,13 +104,25 @@ export function makeWebSearchTool(): RegisteredTool<SearchArgs, SearchResult> {
     const num = Math.max(1, Math.min(20, Number(args.numResults ?? 10)));
     const apiKey = process.env.SERPER_API_KEY;
     if (!apiKey) {
+      // Antes esto devolvía ok:true con un resultado inventado que apuntaba
+      // a example.com. Medido el 2026-09-03: la agente buscó "best affiliate
+      // programs for AI tools high commission 2026" —una consulta buena— y
+      // recibió esa ficción como si fuera información real.
+      //
+      // Devolver ok:false es mejor por dos razones: no puede construir un
+      // plan sobre datos que no existen, y el destilador de lecciones marca
+      // la herramienta como callejón sin salida, así que deja de gastar
+      // pasos reintentándola en cada ciclo.
       return {
-        ok: true, provider: "mock", query: q,
-        results: [{
-          title: `[mock] web.search ${q}`,
-          link: "https://example.com/mock",
-          snippet: "SERPER_API_KEY not set — this is a mock result. Set the key in .env to enable real Google search results via serper.dev ($50/mo for 100k queries).",
-        }],
+        ok: false,
+        provider: "sin-configurar",
+        query: q,
+        error:
+          "web.search no tiene credencial (falta SERPER_API_KEY), así que no " +
+          "puedo buscar en la web. NO reintentes esta herramienta en este " +
+          "ciclo: va a fallar igual hasta que el dueño configure la clave. " +
+          "Buscá otro camino con las herramientas que sí funcionan.",
+        results: [],
       };
     }
     try {
