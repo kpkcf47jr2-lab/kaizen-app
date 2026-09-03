@@ -27,10 +27,11 @@ const budget = {
   productAcquisitionUsd: 0, infrastructureUsd: 0, experimentationUsd: 1,
 } as unknown as BudgetProposal;
 
-const texto = (neto: number, hambre?: { quemaUsdDia: number; pisoUsd: number }) =>
+const texto = (neto: number, hambre?: { quemaUsdDia: number; pisoUsd: number; consumidoUsd?: number }) =>
   buildTickMessages({
     agent: agente, snapshot: snapCon(neto), budget,
-    recentEvents: [], toolNames: ["web.search"], hambre,
+    recentEvents: [], toolNames: ["web.search"],
+    hambre: hambre ? { consumidoUsd: 0, ...hambre } : undefined,
   }).map((m) => m.content ?? "").join("\n");
 
 describe("modo hambre", () => {
@@ -101,5 +102,26 @@ describe("pasos sin tope", () => {
     const { pasosMaximosParaTest } = await import("../decisionLoop.js");
     process.env.KAIZEN_LAB_MAX_STEPS = "no-soy-un-numero";
     expect(pasosMaximosParaTest()).toBe(6);
+  });
+});
+
+describe("el reloj del hambre lo hace real, no relato", () => {
+  it("lo ya consumido se descuenta de la autonomía", () => {
+    // (11 − 1 − 5) / 0.5 = 10 días, no 20.
+    const t = texto(11, { quemaUsdDia: 0.5, pisoUsd: 1, consumidoUsd: 5 });
+    expect(t).toContain("10.0 días");
+    expect(t).toContain("consumidos $5.0000");
+  });
+
+  it("consumir lo suficiente la deja sin autonomía", () => {
+    const t = texto(6.55, { quemaUsdDia: 0.5, pisoUsd: 1, consumidoUsd: 99 });
+    expect(t).toContain("0.0 HORAS");
+  });
+
+  it("le muestra el consumido para que la cuenta le cierre", () => {
+    // Si le decimos que existir cuesta pero su saldo nunca baja, la cuenta
+    // no cierra y deja de tomárselo en serio.
+    const t = texto(6.55, { quemaUsdDia: 0.5, pisoUsd: 1, consumidoUsd: 0.25 });
+    expect(t).toContain("consumidos $0.2500");
   });
 });

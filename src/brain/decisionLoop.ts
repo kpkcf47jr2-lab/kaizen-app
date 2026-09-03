@@ -120,14 +120,24 @@ class DetectorDeVueltas {
  *
  *  KAIZEN_HAMBRE=1 lo activa. Apagado (por defecto) no cambia nada.
  */
-function modoHambre(): Hambre | undefined {
+const HAMBRE_INICIO = "hambre_inicio_ts";
+
+function modoHambre(mem: MemoryStore): Hambre | undefined {
   if (process.env.KAIZEN_HAMBRE !== "1") return undefined;
-  const quema = Number(process.env.KAIZEN_HAMBRE_USD_DIA || 0.5);
-  const piso = Number(process.env.KAIZEN_HAMBRE_PISO_USD || 1);
-  return {
-    quemaUsdDia: Number.isFinite(quema) && quema > 0 ? quema : 0.5,
-    pisoUsd: Number.isFinite(piso) && piso >= 0 ? piso : 1,
-  };
+  const quemaRaw = Number(process.env.KAIZEN_HAMBRE_USD_DIA || 0.5);
+  const pisoRaw = Number(process.env.KAIZEN_HAMBRE_PISO_USD || 1);
+  const quemaUsdDia = Number.isFinite(quemaRaw) && quemaRaw > 0 ? quemaRaw : 0.5;
+  const pisoUsd = Number.isFinite(pisoRaw) && pisoRaw >= 0 ? pisoRaw : 1;
+
+  // El reloj arranca la primera vez y se guarda: así el consumo es real y
+  // creciente entre sesiones, no un número que se reinicia en cada tick.
+  let inicio = Number(mem.getFact(HAMBRE_INICIO) ?? 0);
+  if (!Number.isFinite(inicio) || inicio <= 0) {
+    inicio = Date.now();
+    mem.setFact(HAMBRE_INICIO, String(inicio));
+  }
+  const dias = Math.max(0, (Date.now() - inicio) / 86_400_000);
+  return { quemaUsdDia, pisoUsd, consumidoUsd: dias * quemaUsdDia };
 }
 
 export class DecisionLoop {
@@ -191,7 +201,7 @@ export class DecisionLoop {
         // repetía igual.
         recentTurns: mem.recentTurns(12),
         lecciones: mem.lecciones(12),
-        hambre: modoHambre(),
+        hambre: modoHambre(mem),
       });
     } finally { mem.close(); }
 

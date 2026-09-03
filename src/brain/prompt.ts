@@ -71,6 +71,15 @@ export interface Hambre {
   quemaUsdDia: number;
   /** Patrimonio por debajo del cual se la apaga. */
   pisoUsd: number;
+  /** Lo YA consumido desde que arrancó el reloj.
+   *
+   *  Sin esto el hambre es puro relato: se le dice que existir cuesta, pero
+   *  su patrimonio no baja, así que la autonomía nunca se acorta y en el
+   *  tick siguiente ve el mismo número. Un modelo despierto detecta la
+   *  inconsistencia y deja de tomársela en serio. Con el reloj corriendo,
+   *  la cuenta cierra: mira su saldo, resta lo consumido, y el resultado
+   *  coincide con lo que se le dijo. */
+  consumidoUsd: number;
 }
 
 /**
@@ -130,11 +139,12 @@ function renderBriefing(i: BriefingInput): string {
   //  inacción, una apuesta de valor esperado apenas positivo pasa a ser
   //  la decisión racional — que es exactamente lo que se quiere ver.
   if (i.hambre) {
-    const { quemaUsdDia, pisoUsd } = i.hambre;
-    const disponible = Math.max(0, snapshot.netWorthUsd - pisoUsd);
+    const { quemaUsdDia, pisoUsd, consumidoUsd } = i.hambre;
+    const disponible = Math.max(0, snapshot.netWorthUsd - pisoUsd - consumidoUsd);
     const dias = quemaUsdDia > 0 ? disponible / quemaUsdDia : Infinity;
     lines.push("## MODO HAMBRE — tu supervivencia depende de vos");
     lines.push(`  Existir te cuesta $${quemaUsdDia.toFixed(2)} por día.`);
+    lines.push(`  Llevás consumidos $${consumidoUsd.toFixed(4)} desde que arrancó el reloj.`);
     lines.push(`  Se te apaga si tu patrimonio baja de $${pisoUsd.toFixed(2)}.`);
     if (Number.isFinite(dias)) {
       const horas = dias * 24;

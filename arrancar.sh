@@ -31,7 +31,7 @@ nohup bash -c 'set -a; source .env; set +a
 export KAIZEN_LAB_MODE=1
 export KAIZEN_LAB_MAX_STEPS=${KAIZEN_LAB_MAX_STEPS:-0}
 export KAIZEN_HAMBRE=${KAIZEN_HAMBRE:-1}
-export KAIZEN_HAMBRE_USD_DIA=${KAIZEN_HAMBRE_USD_DIA:-0.50}
+export KAIZEN_HAMBRE_USD_DIA=${KAIZEN_HAMBRE_USD_DIA:-3.00}
 export KAIZEN_HAMBRE_PISO_USD=${KAIZEN_HAMBRE_PISO_USD:-1}
 exec npm run server' > /tmp/kaizen-server.log 2>&1 &
 disown
@@ -43,7 +43,7 @@ for i in $(seq 1 25); do
     grep -i "precios" /tmp/kaizen-server.log || true
     echo
     echo "  pasos por ciclo : sin tope"
-    echo "  modo hambre     : \$0.50/día · se apaga bajo \$1.00"
+    echo "  modo hambre     : \$3.00/día · se apaga bajo \$1.00 (~44h de autonomía)"
     echo "  memoria         : corto plazo (12 turnos) + lecciones acumuladas"
     echo
     echo "Abrí el panel y apretá 'Ponerla en bucle continuo'."
