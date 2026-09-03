@@ -5,9 +5,23 @@
 //  cuenta con tarjeta de un humano. Eso rompe la premisa: si alguien tiene
 //  que poner la tarjeta, la agente no se autoabastece.
 //
-//  Spheron corre su mainnet sobre BASE —la misma cadena donde ya vive el
-//  USDC de Kaizen— con escrow on-chain y leases. El SDK firma con una llave
-//  privada, así que ella paga su propio cómputo sin intermediario.
+//  Spheron corre sobre BASE con escrow on-chain, y el SDK firma con una
+//  llave privada — así ella paga su propio cómputo sin intermediario.
+//
+//  ⚠ VERIFICADO CONTRA EL SDK REAL (2026-09-03, @spheron/protocol-sdk 2.6.0).
+//  Lo que este archivo afirmaba antes era falso y habría fallado en cada
+//  intento:
+//
+//    · El escrow de mainnet NO acepta USDC. getUserBalance("USDC") tira
+//      "Transaction failed without revert data". El único símbolo en el
+//      tokenMap de mainnet es uSPON.
+//    · Y el uSPON de "mainnet" apunta a la constante uSPONTestnet
+//      (0xeD8F…23D2), que NO tiene código en Base mainnet (8453) — sólo en
+//      Base Sepolia (84532).
+//
+//  O sea: con esta versión del SDK, Spheron sólo es usable en TESTNET.
+//  `redUsable()` lo detecta antes de gastar y lo explica, en vez de dejar
+//  que la agente falle depositando contra un contrato inexistente.
 //
 //  SEGURIDAD — por qué esto recibe una función y no una llave:
 //  la llave de Kaizen vive cifrada en el vault y sólo se abre dentro del
@@ -34,6 +48,10 @@ export interface SpheronConfig {
 
 /** Sin listado on-chain, el catálogo es explícito y auditable: `list()` no
  *  inventa precios. Referencia de Spheron al 2026-09-03. */
+/** Dirección del uSPON que el SDK usa. Verificado el 2026-09-03: tiene código
+ *  en Base Sepolia (84532) y NO existe en Base mainnet (8453). */
+const USPON_ADDR = "0xeD8F325cDc2BA7567395cb451A2ea8FAf40E23D2";
+
 const DEFAULT_CATALOG: GpuOption[] = [
   { id: "rtx4090", name: "RTX 4090 24GB", hourlyUsd: 0.35, vramGb: 24 },
   { id: "a100-40", name: "A100 40GB", hourlyUsd: 1.10, vramGb: 40 },
@@ -50,12 +68,46 @@ export class SpheronComputeProvider implements ComputeProvider {
   private readonly rentals = new Map<string, Rental>();
 
   constructor(cfg: SpheronConfig) {
+    const networkType = cfg.networkType ?? "mainnet";
     this.cfg = {
       ...cfg,
-      networkType: cfg.networkType ?? "mainnet",
-      token: cfg.token ?? "USDC",
+      networkType,
+      // VERIFICADO CONTRA EL SDK REAL (2026-09-03, @spheron/protocol-sdk 2.6.0):
+      // el escrow NO acepta "USDC" en mainnet. getUserBalance("USDC") tira
+      // "Transaction failed without revert data"; el único símbolo del
+      // tokenMap de mainnet es uSPON. En testnet sí hay USDC de prueba.
+      token: cfg.token ?? (networkType === "mainnet" ? "uSPON" : "USDC"),
       providerProxyUrl: cfg.providerProxyUrl ?? "https://provider-proxy.spheron.network",
     };
+  }
+
+  /** Comprueba que la red elegida sea realmente usable ANTES de gastar.
+   *
+   *  Hace falta porque el SDK 2.6.0 apunta el uSPON de "mainnet" a la
+   *  constante uSPONTestnet (0xeD8F…23D2), y ese contrato NO está desplegado
+   *  en Base mainnet — sólo en Base Sepolia. Sin esta comprobación la agente
+   *  intentaría depositar contra un contrato inexistente, fallaría sin
+   *  mensaje claro, y volvería a intentarlo sin entender por qué.
+   */
+  async redUsable(): Promise<{ ok: boolean; motivo?: string }> {
+    if (this.cfg.networkType !== "mainnet") return { ok: true };
+    try {
+      const { ethers } = await import("ethers");
+      const prov = new ethers.JsonRpcProvider("https://mainnet.base.org");
+      const code = await prov.getCode(USPON_ADDR);
+      if (code === "0x") {
+        return {
+          ok: false,
+          motivo:
+            `El token uSPON (${USPON_ADDR}) no está desplegado en Base mainnet — ` +
+            `el SDK apunta ahí una dirección de testnet. Spheron mainnet no es ` +
+            `usable con esta versión del SDK. Usá networkType:"testnet".`,
+        };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, motivo: `No se pudo verificar la red: ${(e as Error).message}` };
+    }
   }
 
   /** El SDK se construye por operación y se descarta: la llave no queda
@@ -118,6 +170,11 @@ export class SpheronComputeProvider implements ComputeProvider {
       status: "failed",
     };
     if (!opt) return { ...base, reason: `GPU desconocida: ${req.gpuTypeId}` };
+
+    // Antes de tocar plata: ¿esta red sirve? Fallar acá con un motivo claro
+    // es mucho mejor que fallar depositando contra un contrato inexistente.
+    const red = await this.redUsable();
+    if (!red.ok) return { ...base, reason: red.motivo ?? "Red no usable" };
 
     // El costo entero del alquiler tiene que estar depositado ANTES de
     // arrancar: si el escrow se vacía a mitad, el lease muere y se pierde

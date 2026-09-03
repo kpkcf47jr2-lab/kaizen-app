@@ -80,3 +80,39 @@ describe("SpheronComputeProvider", () => {
     expect(icl).toContain("token: USDC");
   });
 });
+
+// Hallazgos verificados contra el SDK real el 2026-09-03. Estos tests son la
+// memoria de por qué el adaptador quedó así: sin ellos, alguien "arregla" el
+// default a USDC y la agente vuelve a fallar en cada alquiler.
+describe("token y red — verificado contra @spheron/protocol-sdk 2.6.0", () => {
+  const llaveFalsa = async () => "0x" + "11".repeat(32);
+
+  it("en mainnet usa uSPON, NO USDC — el escrow rechaza USDC", () => {
+    const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "mainnet" });
+    expect((p as unknown as { cfg: { token: string } }).cfg.token).toBe("uSPON");
+  });
+
+  it("en testnet usa USDC, que ahí sí existe", () => {
+    const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "testnet" });
+    expect((p as unknown as { cfg: { token: string } }).cfg.token).toBe("USDC");
+  });
+
+  it("un token explícito manda sobre el default", () => {
+    const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "mainnet", token: "DAI" });
+    expect((p as unknown as { cfg: { token: string } }).cfg.token).toBe("DAI");
+  });
+
+  it("testnet se considera usable sin consultar la cadena", async () => {
+    const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "testnet" });
+    await expect(p.redUsable()).resolves.toEqual({ ok: true });
+  });
+
+  it("no arranca un alquiler si la red no sirve, y dice por qué", async () => {
+    const p = new SpheronComputeProvider({ getPrivateKey: llaveFalsa, networkType: "mainnet" });
+    // Se fuerza el veredicto para no depender de la red en los tests.
+    p.redUsable = async () => ({ ok: false, motivo: "uSPON no existe en Base mainnet" });
+    const r = await p.rent({ gpuTypeId: "rtx4090", hoursMax: 1 } as never);
+    expect(r.status).toBe("failed");
+    expect(r.reason).toContain("uSPON no existe");
+  });
+});
