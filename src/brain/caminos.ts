@@ -24,13 +24,14 @@ export async function verificarKame(): Promise<boolean> {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 8000);
     try {
-      const r = await fetch(`${base.replace(/\/$/, "")}/generate`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ network: "x", topic: "ping de verificación", tone: "educational" }),
+      // Se comprueba con una LECTURA barata, no disparando una generación.
+      // La primera versión hacía POST /generate para probar: eso crea un
+      // trabajo real, tarda más de 8s y el timeout lo mataba — daba "caído"
+      // sobre un servicio que funcionaba perfecto.
+      const r = await fetch(`${base.replace(/\/$/, "")}/workflows`, {
         signal: ctl.signal,
       });
-      kameVerificado = r.status !== 404;
+      kameVerificado = r.ok;
     } finally { clearTimeout(t); }
   } catch {
     kameVerificado = false;
