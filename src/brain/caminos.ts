@@ -77,10 +77,22 @@ export function caminosDisponibles(): Camino[] {
           : "kame.* sin verificar todavía",
     },
     {
-      nombre: "operar en cadena",
+      // Yo mismo le había escrito acá que el deslizamiento "se come casi
+      // cualquier ventaja". Ella lo leía y descartaba el camino: en 8.506
+      // turnos usó exchange.quote DOS veces. Era una advertencia disfrazada
+      // de descripción, y le cerró el único ingreso que tiene disponible hoy
+      // —afiliación espera un tag, el video está caído—.
+      //
+      // El costo real sigue estando dicho, porque ocultarlo sería peor. Lo
+      // que cambia es que ya no se presenta como un motivo para no intentar.
+      nombre: "operar en cadena (trading)",
       abierto: true,
-      detalle: "exchange.quote y exchange.swap funcionan, pero con $3 el " +
-               "deslizamiento y el gas se comen casi cualquier ventaja",
+      detalle: "exchange.quote y exchange.swap funcionan HOY sobre Kairos " +
+               "Exchange, multicadena, con tu propio USDC y sin depender de " +
+               "nadie. Es tu única fuente de ingreso disponible ahora mismo. " +
+               "Cotizá antes de ejecutar y mirá el costo total —gas más " +
+               "deslizamiento— contra la ganancia esperada: si no la cubre, " +
+               "buscá otra operación, no abandones el camino.",
     },
     {
       nombre: "enlaces de afiliado",
