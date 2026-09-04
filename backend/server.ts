@@ -466,6 +466,16 @@ async function makeApp() {
     }
   });
 
+  // Lo que APRENDIÓ, para que el dueño lo vea sin abrir la base a mano.
+  app.get("/agents/:id/lecciones", async (req, res) => {
+    const mem = new MemoryStore(req.params.id);
+    try {
+      res.json({ lecciones: mem.lecciones(15) });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    } finally { mem.close(); }
+  });
+
   app.get("/agents/:id/turns", async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 30), 200);
     const mem = new MemoryStore(req.params.id);

@@ -12,6 +12,7 @@
 import { PermissionLevel } from "../policy/limits.js";
 import type { RegisteredTool, ToolFn } from "./registry.js";
 import type { SecureWalletService } from "../../backend/wallet/service.js";
+import { cadenaPorDefecto } from "./cadena.js";
 import { MemoryStore } from "../memory/store.js";
 
 const ROUTER_BASE = process.env.KAIROS_ROUTER_BASE || "https://api.kairos777.com/api/router";
@@ -45,7 +46,7 @@ export function makeQuoteTool(): RegisteredTool<QuoteArgs, QuoteResult> {
     const sell = args.sellToken === "native" ? NATIVE : args.sellToken;
     const buy = args.buyToken === "native" ? NATIVE : args.buyToken;
     const wei = BigInt(Math.floor(args.sellAmount * 10 ** args.sellDecimals)).toString();
-    const chainId = args.chainId ?? POLYGON_CHAIN_ID;
+    const chainId = args.chainId ?? cadenaPorDefecto();
     const url =
       `${ROUTER_BASE}/quote?chainId=${chainId}` +
       `&sellToken=${sell}&buyToken=${buy}&sellAmount=${wei}`;

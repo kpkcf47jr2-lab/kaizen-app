@@ -74,6 +74,19 @@
       Cada ciclo encadena pasos sin tope hasta que deje de pedir herramientas.</p>
   </div>
 
+  <div class="tarjeta">
+    <div class="etq" style="margin-bottom:8px">
+      En vivo <span id="latido" style="color:var(--verde)">•</span>
+      <span style="float:right" id="contadorPasos"></span>
+    </div>
+    <div id="vivo" style="max-height:360px; overflow-y:auto"></div>
+  </div>
+
+  <div class="tarjeta oculto" id="cajaLecciones">
+    <div class="etq" style="margin-bottom:8px">Lo que aprendió</div>
+    <div id="lecciones"></div>
+  </div>
+
   <div class="tarjeta oculto" id="cajaPasos">
     <div class="etq" style="margin-bottom:6px">Lo que hizo</div>
     <div id="pasos"></div>
@@ -235,6 +248,72 @@ const PROMPT = [
   "Si un camino ya lo probaste y no funcionó, está en tu memoria: no lo repitas.",
   "Empezá ahora y encadená los pasos que necesites.",
 ].join("\n");
+
+
+// ── Vista en vivo ───────────────────────────────────────────────────
+// El dueño no podía ver qué estaba haciendo: el panel sólo mostraba saldo y
+// un botón. Esto sondea sus turnos y sus lecciones cada 4s.
+let ultimoTs = 0;
+let vistos = 0;
+
+function pintarPaso(t) {
+  const hora = new Date(t.ts).toLocaleTimeString();
+  const div = document.createElement("div");
+  div.className = "paso";
+  if (t.toolCall) {
+    let nombres = "";
+    try { nombres = JSON.parse(t.toolCall).map(c => c.function?.name).filter(Boolean).join(", "); }
+    catch { nombres = "herramienta"; }
+    const res = (t.toolResult || "");
+    const malo = /error|rechaz|reject|fail/i.test(res);
+    div.innerHTML = `<span class="n">${hora}</span><span class="tool">${nombres}</span>` +
+      `<span class="${malo ? "mal" : "ok"}" style="flex:1">${res.slice(0,110) || "(sin resultado)"}</span>`;
+  } else {
+    const txt = (t.content || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    if (!txt) return null;
+    div.innerHTML = `<span class="n">${hora}</span><span class="etq" style="flex:1">${txt.slice(0,180)}</span>`;
+  }
+  return div;
+}
+
+async function refrescarVivo() {
+  try {
+    const r = await fetch("/agents/agt_demo/turns?limit=40");
+    if (!r.ok) return;
+    const d = await r.json();
+    const turns = (d.turns || []).filter(t => t.ts > ultimoTs);
+    if (turns.length) {
+      const cont = $("vivo");
+      for (const t of turns) {
+        const el = pintarPaso(t);
+        if (el) { cont.insertBefore(el, cont.firstChild); vistos++; }
+        ultimoTs = Math.max(ultimoTs, t.ts);
+      }
+      while (cont.children.length > 60) cont.removeChild(cont.lastChild);
+      $("contadorPasos").textContent = vistos + " pasos";
+      $("latido").style.color = "var(--verde)";
+    }
+  } catch { $("latido").style.color = "var(--rojo)"; }
+}
+
+async function refrescarLecciones() {
+  try {
+    const r = await fetch("/agents/agt_demo/lecciones");
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.lecciones?.length) return;
+    $("cajaLecciones").classList.remove("oculto");
+    $("lecciones").innerHTML = d.lecciones.map(l =>
+      `<div class="paso"><span class="n">${l.veces}×</span>` +
+      `<span class="${l.util ? "" : "medio"}" style="flex:1">${l.leccion.slice(0,150)}</span></div>`
+    ).join("");
+  } catch {}
+}
+
+setInterval(refrescarVivo, 4000);
+setInterval(refrescarLecciones, 15000);
+setInterval(cargarEstado, 30000);
+refrescarVivo(); refrescarLecciones();
 
 cargarEstado();
 </script>

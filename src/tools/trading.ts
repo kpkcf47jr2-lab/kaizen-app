@@ -1,3 +1,4 @@
+import { cadenaPorDefecto } from "./cadena.js";
 // ═══════════════════════════════════════════════════════════════════════
 //  Kaizen — Trading tools
 //
@@ -102,7 +103,7 @@ export interface OpenPositionArgs {
   strategy: string;
   buyToken: string;
   buyTokenDecimals: number;      // required so scheduler mark-to-market works
-  chainId?: number;              // default 137 (Polygon)
+  chainId?: number;              // por defecto, donde tiene fondos (Base)
   entryUsd: number;
   entryPriceUsd?: number;        // USD per whole token at open; enables TP/SL
   reason: string;
@@ -122,7 +123,7 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
       const id = mem.openPosition({
         openedTs: Date.now(),
         strategy: args.strategy,
-        chainId: args.chainId ?? 137,
+        chainId: args.chainId ?? cadenaPorDefecto(),
         sellToken: "USDC",
         buyToken: args.buyToken,
         buyTokenDecimals: args.buyTokenDecimals,
@@ -139,7 +140,7 @@ export function makeOpenPositionTool(): RegisteredTool<OpenPositionArgs, OpenPos
         metadata: JSON.stringify({
           positionId: id,
           buyToken: args.buyToken,
-          chainId: args.chainId ?? 137,
+          chainId: args.chainId ?? cadenaPorDefecto(),
           entryPriceUsd: args.entryPriceUsd ?? null,
         }),
       });
