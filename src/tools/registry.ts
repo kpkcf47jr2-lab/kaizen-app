@@ -57,7 +57,23 @@ export class ToolRegistry {
   }
 
   get(name: string): RegisteredTool | undefined {
-    return this.tools.get(name);
+    const exacto = this.tools.get(name);
+    if (exacto) return exacto;
+
+    // Tolerancia al separador. Kaizen-8B pidió `web_search` seis veces
+    // seguidas (2026-09-03) en vez de `web.search`, y cada una se rechazó
+    // con "Unknown tool" — su herramienta más útil quedó inalcanzable por un
+    // punto. Algunos parsers de tool-calling normalizan el punto a guion
+    // bajo, así que el nombre que llega no siempre es el que se publicó.
+    //
+    // Se resuelve acá, en un solo lugar, en vez de renombrar las 36
+    // herramientas: el nombre con punto sigue siendo el canónico.
+    const normal = (s: string) => s.replace(/[._-]/g, "").toLowerCase();
+    const buscado = normal(name);
+    for (const [registrado, tool] of this.tools) {
+      if (normal(registrado) === buscado) return tool;
+    }
+    return undefined;
   }
 
   list(): ToolDefinition[] {
