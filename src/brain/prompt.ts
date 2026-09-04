@@ -60,10 +60,19 @@ export interface BriefingInput {
   recentTurns?: ConversationTurn[];
   /** Lo que APRENDIÓ, destilado y acumulado entre sesiones. */
   lecciones?: Leccion[];
+  /** Qué caminos a ingreso tienen credencial y cuáles no. */
+  caminos?: Camino[];
   /** Presión de supervivencia. Sin esto "no hacer nada" siempre gana:
    *  esperar no cuesta, así que la opción segura es siempre quedarse
    *  quieta. Con costo de vida, la inacción también se paga. */
   hambre?: Hambre;
+}
+
+export interface Camino {
+  nombre: string;
+  abierto: boolean;
+  /** Qué se puede hacer con él, o qué le falta para abrirse. */
+  detalle: string;
 }
 
 export interface Hambre {
@@ -200,6 +209,26 @@ function renderBriefing(i: BriefingInput): string {
       }
     }
     lines.push("");
+  }
+
+  // Ve 36 herramientas como una lista de nombres y no sabe cuáles tienen
+  // credencial. Resultado medido el 2026-09-03: en 20 minutos hizo 15
+  // búsquedas y 6 transferencias, y NUNCA —ni una vez en toda su vida—
+  // probó sites.deployLanding, su único camino a ingreso que no depende de
+  // que el dueño consiga nada. Saber qué está abierto no le quita decisión:
+  // se la devuelve, porque deja de gastar ciclos contra puertas cerradas.
+  if (i.caminos) {
+    const abiertos = i.caminos.filter((c) => c.abierto);
+    const cerrados = i.caminos.filter((c) => !c.abierto);
+    lines.push("## Caminos a ingreso — cuáles están abiertos AHORA");
+    for (const c of abiertos) lines.push(`  ✓ ${c.nombre} — ${c.detalle}`);
+    for (const c of cerrados) lines.push(`  ✗ ${c.nombre} — ${c.detalle}`);
+    lines.push("");
+    if (abiertos.length > 0) {
+      lines.push(`  No gastes ciclos en los cerrados: van a fallar igual hasta que el`);
+      lines.push(`  dueño consiga lo que falta. Trabajá con los abiertos.`);
+      lines.push("");
+    }
   }
 
   lines.push("## Tools available");

@@ -26,6 +26,7 @@ import { snapshot, proposeBudget } from "./economic.js";
 import type { Snapshot, BudgetProposal, Balances, Position } from "./economic.js";
 import { buildTickMessages } from "./prompt.js";
 import type { Hambre } from "./prompt.js";
+import { caminosDisponibles } from "./caminos.js";
 import type { LLMClient, ChatMessage, ToolCallEmission } from "./llm.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { MemoryStore } from "../memory/store.js";
@@ -335,6 +336,7 @@ export class DecisionLoop {
         recentTurns: mem.recentTurns(12),
         lecciones: mem.lecciones(12),
         hambre: modoHambre(mem),
+        caminos: caminosDisponibles(),
       });
     } finally { mem.close(); }
 
