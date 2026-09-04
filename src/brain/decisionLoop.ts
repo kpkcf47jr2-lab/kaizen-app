@@ -168,6 +168,24 @@ function resultadoVacio(result: unknown): string | null {
 /** Sólo para tests. */
 export const resultadoVacioParaTest = resultadoVacio;
 
+/** Cuántos caracteres de conversación entran, descontando todo lo demás
+ *  que viaja en la misma petición.
+ *
+ *  Se usa una relación conservadora de 2,5 caracteres por token: el español
+ *  y el JSON de los esquemas rinden bastante menos que los 3,5-4 del inglés
+ *  corrido, y sobreestimar es justo lo que reventó la ventana.
+ */
+export function presupuestoDeConversacion(
+  charsDeEsquemas: number,
+  ventanaTokens = Number(process.env.KAIZEN_VENTANA_TOKENS || 16384),
+  salidaTokens = Number(process.env.KAIZEN_LLM_MAX_TOKENS || 768),
+): number {
+  const CHARS_POR_TOKEN = 2.5;
+  const margen = 800;   // colchón para plantilla de chat y redondeos
+  const libres = ventanaTokens - charsDeEsquemas / CHARS_POR_TOKEN - salidaTokens - margen;
+  return Math.max(2000, Math.floor(libres * CHARS_POR_TOKEN));
+}
+
 /** Recorta la conversación sin romper el emparejamiento assistant→tool.
  *
  *  Hace falta porque en modo laboratorio la charla crece con cada paso y
@@ -342,6 +360,15 @@ export class DecisionLoop {
 
     // 3. DECIDE — call the LLM with tools
     const toolSchema = this.tools.toOpenAiSchema();
+
+    // El presupuesto de la conversación NO es la ventana entera: en la misma
+    // petición viajan los esquemas de las 36 herramientas (~20.000 caracteres)
+    // y hay que dejar sitio para la respuesta. Presupuestar sólo los mensajes
+    // fue lo que hizo reventar el contexto con "maximum context length is
+    // 16384 tokens" pese a estar recortando.
+    const presupuestoChars = presupuestoDeConversacion(
+      JSON.stringify(toolSchema).length,
+    );
     const resp = await this.llm.chat(messages, toolSchema);
 
     // Persist the assistant turn (with tool_calls if any) for memory continuity
@@ -423,8 +450,7 @@ export class DecisionLoop {
               `pieza. Si un camino ya lo probaste y estaba vacío, elegí otro.\n\n` +
               `Llamá una herramienta.`,
           } as ChatMessage);
-          messages = recortarConversacion(messages);
-          messages = recortarConversacion(messages);
+          messages = recortarConversacion(messages, presupuestoChars);
         current = await this.llm.chat(messages, toolSchema);
           addUsage(current.usage);
           this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
@@ -466,7 +492,7 @@ export class DecisionLoop {
         }
 
         if (trabada || i === maxSteps - 1) break;
-        messages = recortarConversacion(messages);
+        messages = recortarConversacion(messages, presupuestoChars);
         current = await this.llm.chat(messages, toolSchema);
         addUsage(current.usage);
         this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);

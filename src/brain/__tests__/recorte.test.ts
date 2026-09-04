@@ -89,3 +89,34 @@ describe("recortarConversacion", () => {
     expect(() => recortarConversacion([herr("c1", "suelto")], 1)).not.toThrow();
   });
 });
+
+// El recortador presupuestaba SÓLO los mensajes, ignorando que en la misma
+// petición viajan los esquemas de las 36 herramientas (~20.000 caracteres) y
+// el espacio para la respuesta. Por eso reventaba con "maximum context length
+// is 16384 tokens" pese a estar recortando.
+describe("presupuesto — descuenta todo lo que viaja en la petición", () => {
+  it("con los esquemas reales deja un presupuesto que SÍ entra", async () => {
+    const { presupuestoDeConversacion } = await import("../decisionLoop.js");
+    const p = presupuestoDeConversacion(20_376);   // 36 herramientas medidas
+    const tokensConversacion = p / 2.5;
+    const tokensEsquemas = 20_376 / 2.5;
+    expect(tokensConversacion + tokensEsquemas + 768).toBeLessThan(16_384);
+  });
+
+  it("a más herramientas, menos conversación", async () => {
+    const { presupuestoDeConversacion } = await import("../decisionLoop.js");
+    expect(presupuestoDeConversacion(40_000)).toBeLessThan(presupuestoDeConversacion(10_000));
+  });
+
+  it("nunca devuelve un presupuesto absurdo, aunque los esquemas sean enormes", async () => {
+    const { presupuestoDeConversacion } = await import("../decisionLoop.js");
+    // Sin piso, la agente quedaría sin poder mandar ni el briefing.
+    expect(presupuestoDeConversacion(500_000)).toBeGreaterThanOrEqual(2000);
+  });
+
+  it("se adapta si el modelo tiene otra ventana", async () => {
+    const { presupuestoDeConversacion } = await import("../decisionLoop.js");
+    expect(presupuestoDeConversacion(20_376, 32_768)).toBeGreaterThan(
+      presupuestoDeConversacion(20_376, 16_384));
+  });
+});
