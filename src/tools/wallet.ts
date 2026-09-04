@@ -13,6 +13,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 import { PermissionLevel } from "../policy/limits.js";
+import { revisarDestino } from "../policy/destinos.js";
 import type { RegisteredTool, ToolFn } from "./registry.js";
 import type { SecureWalletService } from "../../backend/wallet/service.js";
 
@@ -77,13 +78,24 @@ export function makeTransferTool(
   service: SecureWalletService,
 ): RegisteredTool<TransferArgs, TransferResult> {
   const exec: ToolFn<TransferArgs, TransferResult> = async (args, ctx) => {
+    // Si no dice cadena, se usa DONDE TIENE PLATA — no un 137 fijo. Su USDC
+    // vive en Base desde el primer swap, así que el default viejo la mandaba
+    // a una cadena con saldo cero: fallaba, reintentaba, y así en bucle.
+    let chainId = args.chainId;
+    if (chainId === undefined) {
+      const b = await service.readBalances(ctx.agentId).catch(() => null);
+      const conSaldo = b && Object.entries(b.byChain)
+        .filter(([, v]) => v.usdc >= args.amountUsdc)
+        .sort((x, y) => y[1].usdc - x[1].usdc)[0];
+      chainId = conSaldo ? Number(conSaldo[0]) : 137;
+    }
     const result = await service.transferUsdc({
       agentId: ctx.agentId,
       to: args.to,
       destinationRole: args.destinationRole,
       amountUsdc: args.amountUsdc,
       reason: args.reason,
-      chainId: args.chainId,
+      chainId,
     });
     if (!result.ok) {
       throw new Error(`Policy rejected: ${result.reason}`);
@@ -139,12 +151,20 @@ export function makeTransferTool(
       },
     },
     exec,
-    toIntent: (a, _ctx) => ({
-      tool: "wallet.transfer",
-      level: PermissionLevel.FINANCIAL,
-      valueUsd: a.amountUsdc,
-      destinationRole: a.destinationRole,
-      chainId: a.chainId ?? 137,
-    }),
+    toIntent: (a, _ctx) => {
+      // El destino se REVISA acá, antes de la Policy Engine. Antes iba sólo
+      // el `destinationRole` que la propia agente se inventaba, así que la
+      // prohibición 'transfer-to-unknown-eoa' nunca se evaluaba y se
+      // perdieron $0.06 mandando USDC al contrato de USDC de otra red.
+      const v = revisarDestino(a.to);
+      return {
+        tool: "wallet.transfer",
+        level: PermissionLevel.FINANCIAL,
+        valueUsd: a.amountUsdc,
+        destinationRole: a.destinationRole,
+        chainId: a.chainId ?? 137,
+        ...(v.ok ? {} : { category: v.categoria, metadata: { motivo: v.motivo } }),
+      };
+    },
   };
 }
