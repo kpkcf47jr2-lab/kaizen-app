@@ -41,6 +41,19 @@ export function makeSitesDeployTool(): RegisteredTool<DeployLandingArgs, DeployL
     }
     if (args.html.length > 500_000) throw new Error("HTML too large (max 500 KB)");
 
+    // Guarda de calidad. La descripción pide CSS, pero pedir no alcanza: la
+    // primera página que publicó salió sin una sola línea de estilo —fuente
+    // serif por defecto, viñetas, enlaces violetas— y así no vende nada.
+    // Rechazar deja constancia como lección; una sugerencia se ignora.
+    const problemas = revisarCalidad(args.html);
+    if (problemas.length > 0) {
+      return {
+        ok: false, slug: args.slug, deployedAt: Date.now(),
+        error: `La página no está lista para publicar: ${problemas.join(" ")} ` +
+               `Reescribila con eso resuelto y volvé a intentar.`,
+      };
+    }
+
     // Write to a tmp directory + call wrangler pages deploy.
     // Requires CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID in env
     // + `wrangler` on PATH. Fall back to writing the file + returning
@@ -120,16 +133,37 @@ export function makeSitesDeployTool(): RegisteredTool<DeployLandingArgs, DeployL
     def: {
       name: "sites.deployLanding",
       description:
-        "Publish an HTML landing page to Cloudflare Pages under kaizen-site-<slug>.pages.dev. " +
-        "Requires CLOUDFLARE_API_TOKEN + _ACCOUNT_ID env; falls back to local save if unset. " +
-        "Use for affiliate offer pages, product launches, lead magnets.",
+        "Publica una TIENDA o landing en Cloudflare Pages, en " +
+        "kaizen-site-<slug>.pages.dev, con URL pública real.\n\n" +
+        "CALIDAD — no es opcional. La página tiene que vender a los ojos:\n" +
+        "· CSS SIEMPRE, embebido en <style>. Sin estilos queda un documento\n" +
+        "  gris con viñetas y enlaces violetas, y eso no lo compra nadie.\n" +
+        "· Paleta propia (2-3 colores + neutros), tipografía de sistema, y\n" +
+        "  aire: padding generoso, jerarquía clara, nada apretado.\n" +
+        "· Responsive de verdad: la mayoría entra desde el teléfono.\n" +
+        "· Modo oscuro con prefers-color-scheme.\n\n" +
+        "SI ES UNA TIENDA, tiene que funcionar como tal:\n" +
+        "· Grilla de productos con foto, nombre, precio y botón de compra.\n" +
+        "· Carrito que sume, reste y muestre el total (JS embebido).\n" +
+        "· Ficha de producto con detalle y llamada a la acción visible.\n" +
+        "· Checkout que lleve a un enlace de pago o de afiliado REAL.\n" +
+        "· Confianza: envíos, devoluciones, contacto.\n\n" +
+        "NO sirve una landing genérica sobre vos misma. 'La plataforma de IA\n" +
+        "más avanzada del mundo' no vende nada porque no hay nada que comprar.\n" +
+        "Cada página necesita UN producto concreto y UNA forma de cobrar.",
       level: PermissionLevel.ZERO_COST,
       parameters: {
         type: "object",
         required: ["slug", "html", "reason"],
         properties: {
           slug: { type: "string", description: "kebab-case, 3-64 chars — becomes the subdomain." },
-          html: { type: "string", description: "Full HTML document. Max 500 KB." },
+          html: {
+            type: "string",
+            description:
+              "Documento HTML completo y AUTOSUFICIENTE: <style> embebido " +
+              "obligatorio, y <script> embebido si lleva carrito. Sin archivos " +
+              "externos salvo imágenes por URL. Máximo 500 KB.",
+          },
           reason: { type: "string", description: "Why deploy this — recorded in the ledger." },
         },
       },
@@ -137,6 +171,30 @@ export function makeSitesDeployTool(): RegisteredTool<DeployLandingArgs, DeployL
     exec,
     toIntent: () => ({ tool: "sites.deployLanding", level: PermissionLevel.ZERO_COST }),
   };
+}
+
+/** Revisa que la página tenga lo mínimo para que alguien la mire y compre.
+ *
+ *  No juzga gusto —eso no se puede automatizar— sino ausencias objetivas:
+ *  sin CSS ninguna página vende, y sin viewport se ve rota en el teléfono,
+ *  que es de donde entra casi todo el mundo. */
+export function revisarCalidad(html: string): string[] {
+  const p: string[] = [];
+  const tieneEstilo = /<style[\s>]/i.test(html) || /\sstyle\s*=/i.test(html)
+    || /<link[^>]+stylesheet/i.test(html);
+  if (!tieneEstilo) {
+    p.push("no tiene NADA de CSS — así queda un documento gris con viñetas y " +
+           "enlaces violetas. Embebé un <style> con tu paleta y tipografía.");
+  }
+  if (!/<meta[^>]+viewport/i.test(html)) {
+    p.push("le falta el meta viewport — se ve rota en el teléfono, que es de " +
+           "donde entra la mayoría.");
+  }
+  if (html.length < 800) {
+    p.push("es demasiado corta para vender algo: no alcanza a presentar un " +
+           "producto ni a dar confianza.");
+  }
+  return p;
 }
 
 // ── affiliate.amazon.link ────────────────────────────────────────────
