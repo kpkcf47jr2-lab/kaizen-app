@@ -71,6 +71,7 @@ import { FileVaultStore } from "./wallet/vaultStore.js";
 import { SecureWalletService } from "./wallet/service.js";
 import { ComposedStateLoader } from "./wallet/stateLoader.js";
 import { componerFinancials } from "./wallet/financials.js";
+import { verificarKame } from "../src/brain/caminos.js";
 import { AutoTickScheduler } from "./scheduler.js";
 import { appendEntry, count as waitlistCount, isValidEmail, loadEmails } from "./waitlist.js";
 // Fase 1 multi-turn ReAct runtime — new endpoint POST /agents/:id/run
@@ -147,6 +148,12 @@ async function makeApp() {
   await refrescarPrecios();
   setInterval(() => { void refrescarPrecios(); }, 5 * 60_000).unref();
   console.log(`[precios] ETH=$${stateLoader.currentRates()[8453]?.toFixed(2)} POL=$${stateLoader.currentRates()[137]?.toFixed(4)}`);
+
+  // Se comprueba qué servicios responden ANTES de anunciarlos como caminos
+  // abiertos. Anunciar sin probar hizo que gastara 12 llamadas contra una
+  // ruta inexistente.
+  void verificarKame().then((ok) =>
+    console.log(`[caminos] kame.* ${ok ? "responde" : "NO responde — camino cerrado"}`));
 
   const walletService = new SecureWalletService(vault, stateLoader);
 

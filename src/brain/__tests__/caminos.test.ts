@@ -58,3 +58,32 @@ describe("caminos disponibles", () => {
     expect(buscar("investigar").abierto).toBe(true);
   });
 });
+
+// Yo marqué "crear contenido" como abierto sin probarlo. Ella confió en el
+// mapa y gastó 12 llamadas a kame.createImage: todas devolvieron
+// {"ok":false,"error":"Not Found"}. Un mapa que miente es peor que ninguno —
+// la manda con confianza contra una pared.
+describe("el mapa no afirma sin evidencia", () => {
+  it("sin verificar, NO se anuncia abierto", async () => {
+    const { fijarKameParaTest } = await import("../caminos.js");
+    fijarKameParaTest(null);
+    const c = buscar("contenido");
+    expect(c.abierto).toBe(false);
+    expect(c.detalle).toContain("sin verificar");
+  });
+
+  it("verificado como caído, se lo dice y le pide que NO lo use", async () => {
+    const { fijarKameParaTest } = await import("../caminos.js");
+    fijarKameParaTest(false);
+    const c = buscar("contenido");
+    expect(c.abierto).toBe(false);
+    expect(c.detalle).toContain("Not Found");
+    expect(c.detalle).toContain("NO lo uses");
+  });
+
+  it("verificado como vivo, recién ahí figura abierto", async () => {
+    const { fijarKameParaTest } = await import("../caminos.js");
+    fijarKameParaTest(true);
+    expect(buscar("contenido").abierto).toBe(true);
+  });
+});
