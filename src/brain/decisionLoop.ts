@@ -111,6 +111,32 @@ class DetectorDeVueltas {
   }
 }
 
+/** ¿El resultado trae un error aunque la herramienta no haya lanzado?
+ *
+ *  Muchas herramientas atrapan sus fallos y los devuelven como {error:"..."}
+ *  o {ok:false, reason:"..."}. Para el bucle eso es un tool_call exitoso, y
+ *  sin esto no se aprende nada del fracaso: el 2026-09-03 wallet.transfer
+ *  devolvió "ERC20: transfer amount exceeds balance" cuatro veces seguidas
+ *  y la agente lo reintentó cada vez.
+ */
+function errorEnResultado(result: unknown): string | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  for (const campo of ["error", "reason"]) {
+    const v = r[campo];
+    if (typeof v === "string" && v.trim()) {
+      // `reason` sólo cuenta como fallo si viene con ok:false; algunas
+      // herramientas lo usan para explicar un éxito.
+      if (campo === "reason" && r.ok !== false) continue;
+      return v.trim();
+    }
+  }
+  return null;
+}
+
+/** Sólo para tests. */
+export const errorEnResultadoParaTest = errorEnResultado;
+
 /** ¿La herramienta respondió OK pero sin contenido útil?
  *
  *  Devuelve una descripción corta del vacío, o null si trajo algo. Se mira
@@ -505,6 +531,21 @@ export class DecisionLoop {
           // API de Amazon: para el sistema es un éxito, para ella es una
           // pared. Sin registrarlo, la reintenta en cada ciclo — se observó
           // el 2026-09-03 pidiéndola tres veces seguidas.
+          // Una herramienta puede devolver {error:"..."} como resultado
+          // EXITOSO — no lanza, así que llega acá como tool_call y no como
+          // tool_failed. Observado el 2026-09-03: wallet.transfer devolvió
+          // "ERC20: transfer amount exceeds balance" dos veces seguidas y no
+          // se registraba nada, así que lo volvía a intentar.
+          const err = errorEnResultado(o.result);
+          if (err) {
+            mem.aprender({
+              scope: "herramienta",
+              clave: `error:${o.tool}:${err.slice(0, 50)}`,
+              leccion: `${o.tool} devolvió error: ${err.slice(0, 160)}`,
+              evidencia: err.slice(0, 300),
+              util: false,
+            });
+          }
           const vacio = resultadoVacio(o.result);
           if (vacio) {
             mem.aprender({

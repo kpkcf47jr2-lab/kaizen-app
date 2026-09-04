@@ -178,3 +178,38 @@ describe("carga útil vs metadato", () => {
     expect(vacio({ ok: true, scanned: ["predict"], opportunities: [{ id: 1 }] })).toBeNull();
   });
 });
+
+// Muchas herramientas atrapan su fallo y lo devuelven como resultado: para
+// el bucle es un éxito. El 2026-09-03 wallet.transfer devolvió "ERC20:
+// transfer amount exceeds balance" cuatro veces y la agente lo reintentó
+// cada vez porque nada quedaba registrado.
+describe("errores devueltos como resultado exitoso", () => {
+  let err: (r: unknown) => string | null;
+  beforeEach(async () => {
+    ({ errorEnResultadoParaTest: err } = await import("../decisionLoop.js"));
+  });
+
+  it("detecta el caso real de wallet.transfer", () => {
+    expect(err({ error: 'execution reverted: "ERC20: transfer amount exceeds balance"' }))
+      .toContain("exceeds balance");
+  });
+
+  it("detecta {ok:false, reason}", () => {
+    expect(err({ ok: false, reason: "AMAZON_ASSOCIATES_TAG not set" }))
+      .toBe("AMAZON_ASSOCIATES_TAG not set");
+  });
+
+  it("NO confunde un `reason` que explica un éxito", () => {
+    expect(err({ ok: true, reason: "compré porque el precio bajó" })).toBeNull();
+  });
+
+  it("un resultado limpio no dispara nada", () => {
+    expect(err({ ok: true, txHash: "0xabc", products: [{ id: 1 }] })).toBeNull();
+  });
+
+  it("no rompe con basura", () => {
+    for (const x of [null, undefined, 7, "texto", [], { error: "" }]) {
+      expect(err(x)).toBeNull();
+    }
+  });
+});
