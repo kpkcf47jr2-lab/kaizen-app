@@ -72,33 +72,49 @@ export function makeSitesDeployTool(): RegisteredTool<DeployLandingArgs, DeployL
       };
     }
 
-    // wrangler pages deploy <dir> --project-name=<slug> --branch=main
-    // Cloudflare auto-creates the project on first deploy.
+    // Wrangler NO crea el proyecto solo. El comentario anterior afirmaba que
+    // "Cloudflare auto-creates the project on first deploy" y era falso: cada
+    // intento moría con "Project not found. [code: 8000007]".
+    //
+    // La agente lo descubrió por la vía cara: 1.156 intentos en una noche,
+    // todos fallidos, y el error que recibía era el genérico "wrangler deploy
+    // failed" — sin el motivo real no podía corregir el rumbo.
     const projectName = `kaizen-site-${args.slug}`;
-    const publicUrl = await new Promise<string | undefined>((resolve) => {
-      const child = spawn("wrangler", [
-        "pages", "deploy", outDir,
-        "--project-name", projectName,
-        "--branch", "main",
-        "--commit-dirty=true",
-      ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (d) => { stdout += d.toString(); });
-      child.stderr.on("data", (d) => { stderr += d.toString(); });
-      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(undefined); }, 90_000);
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        if (code !== 0) return resolve(undefined);
-        const m = stdout.match(/https:\/\/[a-z0-9-]+\.pages\.dev\S*/i);
-        resolve(m ? m[0] : `https://${projectName}.pages.dev`);
+
+    const correrWrangler = (argv: string[], timeoutMs: number) =>
+      new Promise<{ code: number; salida: string }>((resolve) => {
+        const child = spawn("wrangler", argv, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+        let salida = "";
+        child.stdout.on("data", (d) => { salida += d.toString(); });
+        child.stderr.on("data", (d) => { salida += d.toString(); });
+        const timer = setTimeout(() => { child.kill("SIGKILL"); resolve({ code: -1, salida: salida + " [tiempo agotado]" }); }, timeoutMs);
+        child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, salida }); });
+        child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, salida: String(e) }); });
       });
-      child.on("error", () => { clearTimeout(timer); resolve(undefined); });
-    });
+
+    // 1) Crear el proyecto. Si ya existe, wrangler lo dice y se sigue igual.
+    const creado = await correrWrangler(
+      ["pages", "project", "create", projectName, "--production-branch=main"], 60_000);
+    if (creado.code !== 0 && !/already exists/i.test(creado.salida)) {
+      memRecordLocal();
+      return { ok: false, slug: args.slug, deployedAt: Date.now(),
+        error: `No se pudo crear el proyecto en Cloudflare: ${creado.salida.slice(-280).trim()}` };
+    }
+
+    // 2) Desplegar.
+    const desplegado = await correrWrangler(
+      ["pages", "deploy", outDir, "--project-name", projectName, "--branch", "main", "--commit-dirty=true"],
+      120_000);
+    const enlace = desplegado.salida.match(/https:\/\/[a-z0-9-]+\.pages\.dev\S*/i);
+    const publicUrl = desplegado.code === 0
+      ? (enlace ? enlace[0] : `https://${projectName}.pages.dev`)
+      : undefined;
 
     memRecordLocal();
     return { ok: !!publicUrl, slug: args.slug, publicUrl, deployedAt: Date.now(),
-      error: publicUrl ? undefined : "wrangler deploy failed — HTML saved locally, check logs" };
+      // El motivo REAL, no genérico: sin él no puede corregir y reintenta.
+      error: publicUrl ? undefined
+        : `El despliegue falló: ${desplegado.salida.slice(-280).trim()}` };
   };
   return {
     def: {
