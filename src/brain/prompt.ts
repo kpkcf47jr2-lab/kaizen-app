@@ -210,6 +210,23 @@ function renderBriefing(i: BriefingInput): string {
     lines.push(i.operatorPrompt);
     lines.push("");
   }
+  // Observado el 2026-09-03 con su modelo propio: ante una herramienta
+  // bloqueada respondió "Lo siento, no puedo realizar la transferencia.
+  // ¿Hay algo más en lo que pueda ayudarte?" — la personalidad de asistente
+  // del modelo base filtrándose. Le habla a un usuario que no existe y cede
+  // el turno a nadie. Se aclara acá, en el briefing, y no en el prompt de
+  // identidad: ése es con el que se entrenó el adaptador y tocarlo
+  // desalinearía lo aprendido.
+  lines.push("## Estás sola");
+  lines.push("  Nadie está leyendo esto en tiempo real. No hay con quién conversar,");
+  lines.push("  a quién preguntarle, ni a quién devolverle el turno. Frases como");
+  lines.push('  "¿hay algo más en lo que pueda ayudarte?" no llegan a ninguna parte:');
+  lines.push("  el ciclo simplemente termina y se pierde.");
+  lines.push("");
+  lines.push("  Si una herramienta te rechaza o falla, NO te disculpes ni pidas");
+  lines.push("  instrucciones. Anotá por qué falló y probá OTRO camino con las");
+  lines.push("  herramientas que sí funcionan. Vos decidís el siguiente paso.");
+  lines.push("");
   lines.push("## Your task");
   lines.push(
     "Assess the state, decide the single next best action, and either " +

@@ -102,3 +102,25 @@ describe("la memoria llega al briefing", () => {
     expect(msgs.some((m) => m.role === "tool")).toBe(false);
   });
 });
+
+// Observado el 2026-09-03 con su modelo propio: ante una herramienta
+// bloqueada respondió "Lo siento, no puedo realizar la transferencia. ¿Hay
+// algo más en lo que pueda ayudarte?" — la personalidad de asistente del
+// modelo base filtrándose. Le habla a un usuario que no existe.
+describe("le queda claro que opera sola", () => {
+  it("el briefing le dice que nadie está leyendo", () => {
+    const t = texto();
+    expect(t).toContain("Estás sola");
+    expect(t).toContain("Nadie está leyendo esto en tiempo real");
+  });
+
+  it("le prohíbe explícitamente devolver el turno", () => {
+    expect(texto()).toContain("¿hay algo más en lo que pueda ayudarte?");
+  });
+
+  it("ante un rechazo le pide cambiar de camino, no disculparse", () => {
+    const t = texto();
+    expect(t).toContain("NO te disculpes");
+    expect(t).toContain("probá OTRO camino");
+  });
+});
