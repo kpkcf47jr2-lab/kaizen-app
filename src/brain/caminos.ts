@@ -24,10 +24,10 @@ export async function verificarKame(): Promise<boolean> {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 8000);
     try {
-      const r = await fetch(`${base.replace(/\/$/, "")}/image`, {
+      const r = await fetch(`${base.replace(/\/$/, "")}/generate`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: "ping", aspectRatio: "1:1", dryRun: true }),
+        body: JSON.stringify({ network: "x", topic: "ping de verificación", tone: "educational" }),
         signal: ctl.signal,
       });
       kameVerificado = r.status !== 404;

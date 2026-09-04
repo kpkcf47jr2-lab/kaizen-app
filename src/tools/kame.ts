@@ -39,13 +39,20 @@ export interface CreateImageResult {
 
 export function makeCreateImageTool(): RegisteredTool<CreateImageArgs, CreateImageResult> {
   const exec: ToolFn<CreateImageArgs, CreateImageResult> = async (args, ctx) => {
+    // Ruta REAL del backend de Oracle, verificada el 2026-09-03. Antes acá
+    // decía "/image", que no existe: devolvía 404 y la agente lo intentó 12
+    // veces creyendo que la herramienta funcionaba.
+    //
+    // Este es el MISMO pipeline de Kame que usa la wallet. No hay una
+    // segunda Kame: el cerebro autónomo llama al cuerpo que ya existe.
     return callKame<CreateImageResult>(
-      "/image",
+      "/generate",
       {
-        prompt: args.prompt,
-        aspectRatio: args.aspectRatio ?? "1:1",
+        topic: args.prompt,
+        network: "x",
+        tone: "educational",
+        campaign: args.reason,
         agentId: ctx.agentId,
-        reason: args.reason,
       },
     );
   };
@@ -109,13 +116,15 @@ export interface CreateVideoResult {
 
 export function makeCreateVideoTool(): RegisteredTool<CreateVideoArgs, CreateVideoResult> {
   const exec: ToolFn<CreateVideoArgs, CreateVideoResult> = async (args, ctx) => {
+    // Ruta REAL: /video/generate. Pide `address` (la wallet del agente),
+    // no `agentId`.
     return callKame<CreateVideoResult>(
-      "/video",
+      "/video/generate",
       {
-        prompt: args.prompt,
+        address: ctx.agentId,
+        topic: args.prompt,
         seconds: args.seconds ?? 6,
         aspectRatio: args.aspectRatio ?? "9:16",
-        agentId: ctx.agentId,
         reason: args.reason,
       },
     );
