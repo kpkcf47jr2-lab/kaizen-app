@@ -167,6 +167,64 @@ function resultadoVacio(result: unknown): string | null {
 /** Sólo para tests. */
 export const resultadoVacioParaTest = resultadoVacio;
 
+/** Recorta la conversación sin romper el emparejamiento assistant→tool.
+ *
+ *  Hace falta porque en modo laboratorio la charla crece con cada paso y
+ *  termina excediendo la ventana del modelo: "maximum context length is
+ *  16384 tokens" mata el ciclo entero.
+ *
+ *  El ContextTrimmer del runtime NO sirve acá: corta en un punto fijo
+ *  (largo − hotPairs*2) y puede dejar un role:"tool" huérfano encabezando
+ *  la cola. Un tool sin el assistant que lo pidió es un 400 — exactamente el
+ *  bug que se arregló hoy. Por eso el corte se corre hasta caer en un
+ *  mensaje que puede abrir la cola.
+ *
+ *  Se conservan siempre el system y el briefing inicial: son la identidad y
+ *  la tarea. Lo que se descarta es el medio, que es historia ya resumida en
+ *  su memoria de largo plazo.
+ */
+export function recortarConversacion(
+  msgs: ChatMessage[],
+  maxCaracteres = Number(process.env.KAIZEN_MAX_CHARS_CONVERSACION || 24000),
+): ChatMessage[] {
+  const total = msgs.reduce((n, m) => n + (m.content?.length ?? 0), 0);
+  if (total <= maxCaracteres || msgs.length <= 3) return msgs;
+
+  // Cabeza fija: system(s) + el primer user (el briefing con su estado).
+  let cabeza = 0;
+  while (cabeza < msgs.length && msgs[cabeza]!.role === "system") cabeza += 1;
+  if (cabeza < msgs.length && msgs[cabeza]!.role === "user") cabeza += 1;
+
+  // Se recorta desde el final hacia atrás hasta entrar en presupuesto.
+  const fijos = msgs.slice(0, cabeza);
+  const gastoFijo = fijos.reduce((n, m) => n + (m.content?.length ?? 0), 0);
+  let inicio = msgs.length;
+  let acumulado = 0;
+  for (let i = msgs.length - 1; i >= cabeza; i -= 1) {
+    const c = msgs[i]!.content?.length ?? 0;
+    if (gastoFijo + acumulado + c > maxCaracteres && inicio < msgs.length) break;
+    acumulado += c;
+    inicio = i;
+  }
+
+  // CLAVE: la cola no puede empezar con un "tool" — quedaría sin el
+  // assistant que lo pidió. Se avanza hasta un mensaje que sí pueda abrirla.
+  while (inicio < msgs.length && msgs[inicio]!.role === "tool") inicio += 1;
+  if (inicio >= msgs.length) return fijos;
+
+  const descartados = inicio - cabeza;
+  if (descartados <= 0) return msgs;
+
+  const nota: ChatMessage = {
+    role: "user",
+    content:
+      `[se recortaron ${descartados} pasos anteriores de esta misma corrida ` +
+      `para no exceder tu ventana de contexto. Lo importante ya está en tu ` +
+      `memoria de largo plazo — seguí desde acá.]`,
+  };
+  return [...fijos, nota, ...msgs.slice(inicio)];
+}
+
 /** Sin freno: la agente no puede terminar la corrida eligiendo esperar.
  *
  *  Directiva del dueño (2026-09-03): "cuando yo la suelte ella no tiene que
@@ -363,7 +421,9 @@ export class DecisionLoop {
               `pieza. Si un camino ya lo probaste y estaba vacío, elegí otro.\n\n` +
               `Llamá una herramienta.`,
           } as ChatMessage);
-          current = await this.llm.chat(messages, toolSchema);
+          messages = recortarConversacion(messages);
+          messages = recortarConversacion(messages);
+        current = await this.llm.chat(messages, toolSchema);
           addUsage(current.usage);
           this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
           continue;
@@ -404,6 +464,7 @@ export class DecisionLoop {
         }
 
         if (trabada || i === maxSteps - 1) break;
+        messages = recortarConversacion(messages);
         current = await this.llm.chat(messages, toolSchema);
         addUsage(current.usage);
         this.persistAssistantTurn(input.agentId, current.content, current.toolCalls);
